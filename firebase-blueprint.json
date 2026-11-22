@@ -1,0 +1,247 @@
+{
+  "entities": {
+    "LeaderboardEntry": {
+      "title": "LeaderboardEntry",
+      "description": "Public player combat rating and match statistics for the global leaderboard (no PII).",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "avatarHue": {
+          "type": "integer"
+        },
+        "elo": {
+          "type": "integer"
+        },
+        "wins": {
+          "type": "integer"
+        },
+        "losses": {
+          "type": "integer"
+        },
+        "draws": {
+          "type": "integer"
+        },
+        "gamesPlayed": {
+          "type": "integer"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "uid",
+        "displayName",
+        "avatarHue",
+        "elo",
+        "wins",
+        "losses",
+        "draws",
+        "gamesPlayed",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "UserPrivateProfile": {
+      "title": "UserPrivateProfile",
+      "description": "Private user account and preferences isolated from public queries.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "email": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128
+        },
+        "preferredSide": {
+          "type": "string",
+          "enum": ["w", "b", "random"]
+        },
+        "preferredLang": {
+          "type": "string",
+          "enum": ["vi", "en"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "uid",
+        "displayName",
+        "email",
+        "preferredSide",
+        "preferredLang",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "MatchRecord": {
+      "title": "MatchRecord",
+      "description": "Immutable completed chess battle record stored in cloud history.",
+      "type": "object",
+      "properties": {
+        "matchId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["ai", "local", "online"]
+        },
+        "opponentName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 48
+        },
+        "playerColor": {
+          "type": "string",
+          "enum": ["w", "b"]
+        },
+        "result": {
+          "type": "string",
+          "enum": ["win", "loss", "draw"]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "movesCount": {
+          "type": "integer"
+        },
+        "eloChange": {
+          "type": "integer"
+        },
+        "durationSec": {
+          "type": "integer"
+        },
+        "pgnSummary": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "matchId",
+        "ownerUid",
+        "mode",
+        "opponentName",
+        "playerColor",
+        "result",
+        "reason",
+        "movesCount",
+        "eloChange",
+        "durationSec",
+        "pgnSummary",
+        "createdAt"
+      ]
+    },
+    "SafetyReport": {
+      "title": "SafetyReport",
+      "description": "Write-only student safety moderation report for online rooms.",
+      "type": "object",
+      "properties": {
+        "reportId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "reporterUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "roomCode": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 12
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "reportId",
+        "reporterUid",
+        "roomCode",
+        "reason",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/leaderboard/{userId}": {
+      "schema": {
+        "$ref": "#/entities/LeaderboardEntry"
+      },
+      "description": "Public player ELO and W/L/D stats for the Global Leaderboard."
+    },
+    "/users/{userId}": {
+      "schema": {
+        "$ref": "#/entities/UserPrivateProfile"
+      },
+      "description": "Owner-only private profile containing email and preferences."
+    },
+    "/matches/{matchId}": {
+      "schema": {
+        "$ref": "#/entities/MatchRecord"
+      },
+      "description": "Owner-only immutable match history records."
+    },
+    "/reports/{reportId}": {
+      "schema": {
+        "$ref": "#/entities/SafetyReport"
+      },
+      "description": "Write-only student safety reports."
+    }
+  }
+}

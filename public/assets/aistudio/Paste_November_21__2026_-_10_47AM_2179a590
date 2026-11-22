@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cờ Vua La Mã 3D - Realistic GLB Edition</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+    body { overflow: hidden; background: #090c14; font-family: 'Segoe UI', Tahoma, sans-serif; color: #f5e6c8; }
+    #canvas-container { width: 100vw; height: 100vh; display: block; }
+
+    /* HUD Giao diện đấu trường */
+    .hud-top {
+      position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+      display: flex; gap: 16px; align-items: center; z-index: 10;
+    }
+    .panel {
+      background: linear-gradient(180deg, rgba(24, 20, 16, 0.92), rgba(14, 12, 10, 0.95));
+      border: 1px solid #8c6d3f; border-radius: 6px; padding: 10px 20px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.7); text-align: center;
+    }
+    .panel-title { font-size: 13px; color: #bfa06a; text-transform: uppercase; letter-spacing: 1px; }
+    .panel-value { font-size: 16px; font-weight: bold; color: #fff; margin-top: 2px; }
+    .turn-badge { border-color: #d4af37; box-shadow: 0 0 15px rgba(212, 175, 55, 0.3); }
+
+    /* Tooltip nổi trên đầu quân cờ */
+    #piece-tooltip {
+      position: fixed; pointer-events: none; z-index: 20;
+      background: rgba(15, 12, 10, 0.9); border: 1px solid #d4af37;
+      padding: 6px 12px; border-radius: 4px; font-size: 13px; font-weight: 600;
+      color: #ffd700; transform: translate(-50%, -130%); display: none;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.8); white-space: nowrap;
+    }
+    #piece-tooltip span { display: block; font-size: 11px; color: #ccc; font-weight: normal; }
+
+    /* Thanh điều khiển dưới */
+    .hud-bottom {
+      position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+      display: flex; gap: 10px; z-index: 10;
+    }
+    button {
+      background: linear-gradient(180deg, #3b2d1f, #221911); color: #f5e6c8;
+      border: 1px solid #9c7a44; padding: 8px 16px; border-radius: 4px;
+      cursor: pointer; font-weight: 600; transition: 0.2s;
+    }
+    button:hover { background: #54402c; border-color: #ffd700; color: #fff; }
+    #loading-status {
+      position: fixed; bottom: 58px; left: 50%; transform: translateX(-50%);
+      font-size: 12px; color: #a89984; background: rgba(0,0,0,0.6); padding: 4px 12px; border-radius: 12px;
+    }
+  </style>
+
+  <!-- Import Maps cho Three.js & Chess.js -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+        "chess.js": "https://unpkg.com/chess.js@1.0.0-beta.8/dist/esm/chess.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div class="hud-top">
+    <div class="panel">
+      <div class="panel-title">Phe Bạn (Quân Đỏ/Vàng)</div>
+      <div class="panel-value">Quân Đoàn La Mã</div>
+    </div>
+    <div class="panel turn-badge">
+      <div class="panel-title">Trạng Thái Trận Đấu</div>
+      <div class="panel-value" id="status-text">Lượt của Bạn</div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Phe Máy (Quân Tím/Đen)</div>
+      <div class="panel-value">Đế Chế Hắc Ám</div>
+    </div>
+  </div>
+
+  <div id="piece-tooltip">Tốt - Lính Lê Dương<span>Di chuyển 1 ô thẳng</span></div>
+  <div id="loading-status">Đang khởi tạo đấu trường 3D...</div>
+
+  <div class="hud-bottom">
+    <button id="btn-reset">Ván Mới</button>
+    <button id="btn-camera">Đổi Góc Nhìn</button>
+  </div>
+
+  <div id="canvas-container"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+    import { Chess } from 'chess.js';
+
+    // =========================================================================
+    // 1. CẤU HÌNH ĐƯỜNG DẪN MÔ HÌNH .GLB (BẠN THAY FILE .GLB THẬT VÀO ĐÂY)
+    // =========================================================================
+    // Đặt file .glb tải từ Sketchfab vào thư mục ./models/ cạnh file index.html
+    const MODEL_CONFIG = {
+      p: { url: './models/roman_legionary.glb', scale: 0.75, name: 'Tốt - Lính Lê Dương', desc: 'Tiến 1 ô, ăn chéo' },
+      r: { url: './models/roman_tower.glb',     scale: 0.85, name: 'Xe - Trọng Giáp Tháp', desc: 'Đi thẳng ngang/dọc không giới hạn' },
+      n: { url: './models/roman_cavalry.glb',   scale: 0.85, name: 'Mã - Kỵ Binh Equites', desc: 'Nhảy hình chữ L, vượt chướng ngại' },
+      b: { url: './models/roman_priest.glb',    scale: 0.85, name: 'Tượng - Tư Tế Augur', desc: 'Đi đường chéo không giới hạn' },
+      q: { url: './models/roman_queen.glb',     scale: 0.92, name: 'Hậu - Nữ Thần Bellona', desc: 'Tấn công mọi hướng ngang, dọc, chéo' },
+      k: { url: './models/roman_emperor.glb',   scale: 0.98, name: 'Vua - Hoàng Đế Caesar', desc: 'Di chuyển 1 ô mọi hướng - Cần bảo vệ' }
+    };
+
+    // =========================================================================
+    // 2. KHỞI TẠO SCENE, CAMERA & RENDERER CHUẨN ĐIỆN ẢNH (KHÔNG BỊ LÓA SÁNG)
+    // =========================================================================
+    const container = document.getElementById('canvas-container');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b101d);
+    scene.fog = new THREE.FogExp2(0x0b101d, 0.022);
+
+    const camera = new THREE.PerspectiveCamera(42, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 10.5, 11.5);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // Sắc nét trên màn hình Retina/4K
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.05; // Giữ mức sáng vừa phải, tuyệt đối không lóa trắng
+    container.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.06;
+    controls.maxPolarAngle = Math.PI / 2.15;
+    controls.minDistance = 6;
+    controls.maxDistance = 22;
+
+    // Hệ thống ánh sáng 3 điểm (Three-Point Lighting + Rim Light)
+    const hemiLight = new THREE.HemisphereLight(0x8ab4f8, 0x2c2218, 0.75);
+    scene.add(hemiLight);
+
+    const keyLight = new THREE.DirectionalLight(0xfff1d6, 2.0);
+    keyLight.position.set(8, 15, 10);
+    keyLight.castShadow = true;
+    keyLight.shadow.mapSize.set(2048, 2048);
+    keyLight.shadow.camera.near = 2;
+    keyLight.shadow.camera.far = 35;
+    const d = 8;
+    keyLight.shadow.camera.left = -d; keyLight.shadow.camera.right = d;
+    keyLight.shadow.camera.top = d; keyLight.shadow.camera.bottom = -d;
+    keyLight.shadow.bias = -0.0005;
+    scene.add(keyLight);
+
+    // Đèn viền xanh lạnh phía sau giúp tách sắc nét đường viền giáp sắt của nhân vật
+    const rimLight = new THREE.DirectionalLight(0x4f8eff, 1.4);
+    rimLight.position.set(-8, 9, -10);
+    scene.add(rimLight);
+
+    // =========================================================================
+    // 3. TẠO VÂN ĐÁ CẨM THẠCH & BÀN CỜ ĐẤU TRƯỜNG LA MÃ
+    // =========================================================================
+    function createMarbleTexture(isWhite) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 256; canvas.height = 256;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = isWhite ? '#d8d2c5' : '#1d2026';
+      ctx.fillRect(0, 0, 256, 256);
+
+      // Vẽ vân đá tự nhiên
+      ctx.strokeStyle = isWhite ? 'rgba(130, 120, 105, 0.25)' : 'rgba(212, 175, 55, 0.14)';
+      for (let i = 0; i < 18; i++) {
+        ctx.lineWidth = Math.random() * 2 + 0.5;
+        ctx.beginPath();
+        let x = Math.random() * 256, y = 0;
+        ctx.moveTo(x, y);
+        while (y < 256) {
+          y += 20;
+          x += (Math.random() - 0.5) * 28;
+          ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      return tex;
+    }
+
+    const whiteTileMat = new THREE.MeshStandardMaterial({ map: createMarbleTexture(true), roughness: 0.45, metalness: 0.05 });
+    const blackTileMat = new THREE.MeshStandardMaterial({ map: createMarbleTexture(false), roughness: 0.35, metalness: 0.15 });
+    const highlightMat = new THREE.MeshStandardMaterial({ color: 0xd4af37, emissive: 0x8a6d1c, emissiveIntensity: 0.6, roughness: 0.3 });
+    const captureMat   = new THREE.MeshStandardMaterial({ color: 0xc92a2a, emissive: 0x7a1212, emissiveIntensity: 0.7, roughness: 0.3 });
+
+    const boardGroup = new THREE.Group();
+    scene.add(boardGroup);
+
+    // Khung viền đá bàn cờ
+    const frameGeo = new THREE.BoxGeometry(9.2, 0.45, 9.2);
+    const frameMat = new THREE.MeshStandardMaterial({ color: 0x2b2620, roughness: 0.7, metalness: 0.2 });
+    const frameMesh = new THREE.Mesh(frameGeo, frameMat);
+    frameMesh.position.y = -0.25;
+    frameMesh.receiveShadow = true;
+    boardGroup.add(frameMesh);
+
+    const tileMeshes = {}; // 'e2' -> Mesh
+    const files = ['a','b','c','d','e','f','g','h'];
+    for (let row = 0; row < 8; row++) {
+      for (let col = 0; col < 8; col++) {
+        const isWhite = (row + col) % 2 === 0;
+        const sq = files[col] + (8 - row);
+        const tile = new THREE.Mesh(
+          new THREE.BoxGeometry(1, 0.12, 1),
+          isWhite ? whiteTileMat : blackTileMat
+        );
+        tile.position.set(col - 3.5, 0, row - 3.5);
+        tile.receiveShadow = true;
+        tile.userData = { square: sq, isWhite, defaultMat: isWhite ? whiteTileMat : blackTileMat };
+        boardGroup.add(tile);
+        tileMeshes[sq] = tile;
+      }
+    }
+
+    // Môi trường đấu trường xung quanh (Cột đá Corinthian & Chậu lửa thật)
+    const arenaFloor = new THREE.Mesh(
+      new THREE.CylinderGeometry(24, 24, 0.2, 48),
+      new THREE.MeshStandardMaterial({ color: 0x181614, roughness: 0.9 })
+    );
+    arenaFloor.position.y = -0.55;
+    arenaFloor.receiveShadow = true;
+    scene.add(arenaFloor);
+
+    const fireLights = [];
+    const pillarPositions = [[-7, -7], [7, -7], [-7, 7], [7, 7]];
+    pillarPositions.forEach(([px, pz]) => {
+      const pillar = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.45, 0.55, 6.5, 20),
+        new THREE.MeshStandardMaterial({ color: 0x5c554b, roughness: 0.8 })
+      );
+      pillar.position.set(px, 2.7, pz);
+      pillar.castShadow = true;
+      pillar.receiveShadow = true;
+      scene.add(pillar);
+
+      // Chậu lửa góc bàn cờ
+      const bx = px * 0.72, bz = pz * 0.72;
+      const brazier = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.35, 0.15, 0.9, 12),
+        new THREE.MeshStandardMaterial({ color: 0x222222, metalness: 0.8, roughness: 0.3 })
+      );
+      brazier.position.set(bx, 0.1, bz);
+      scene.add(brazier);
+
+      const pLight = new THREE.PointLight(0xff6b1a, 4.5, 9);
+      pLight.position.set(bx, 0.9, bz);
+      scene.add(pLight);
+      fireLights.push(pLight);
+    });
+
+    // =========================================================================
+    // 4. BỘ NẠP MÔ HÌNH .GLB THÔNG MINH (TỰ ĐỘNG FALLBACK NẾU CHƯA CÓ FILE)
+    // =========================================================================
+    const gltfLoader = new GLTFLoader();
+    const dracoLoader = new DRACOLoader();
+    dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/');
+    gltfLoader.setDRACOLoader(dracoLoader);
+
+    const loadedTemplates = {}; // Lưu cache model .glb đã tải
+    const mixers = [];          // Lưu AnimationMixer cho các chiến binh có xương
+
+    // Hàm tạo bệ đứng khắc biểu tượng quân cờ để dễ phân biệt
+    function createPedestal(type, colorSide) {
+      const group = new THREE.Group();
+      const isLight = colorSide === 'w';
+      const baseMat = new THREE.MeshStandardMaterial({
+        color: isLight ? 0xc8a45d : 0x2a2438,
+        metalness: 0.75, roughness: 0.25
+      });
+      const base = new THREE.Mesh(new THREE.CylinderGeometry(0.38, 0.42, 0.12, 24), baseMat);
+      base.position.y = 0.06;
+      base.castShadow = true;
+      base.receiveShadow = true;
+      group.add(base);
+
+      // Vòng sáng định danh phe
+      const ring = new THREE.Mesh(
+        new THREE.TorusGeometry(0.39, 0.018, 8, 32),
+        new THREE.MeshStandardMaterial({
+          color: isLight ? 0xff3b30 : 0x9b51e0,
+          emissive: isLight ? 0x801008 : 0x4a148c,
+          emissiveIntensity: 0.8
+        })
+      );
+      ring.rotation.x = Math.PI / 2;
+      ring.position.y = 0.12;
+      group.add(ring);
+      return group;
+    }
+
+    // Mô hình điêu khắc La Mã dự phòng sắc nét (khi bạn chưa kịp chép file .glb vào thư mục)
+    function createFallbackSculpture(type, colorSide) {
+      const isLight = colorSide === 'w';
+      const armorMat = new THREE.MeshStandardMaterial({
+        color: isLight ? 0xd4af37 : 0x2c303a,
+        metalness: 0.82, roughness: 0.22
+      });
+      const cloakMat = new THREE.MeshStandardMaterial({
+        color: isLight ? 0x9e1b1b : 0x4a1c6b,
+        roughness: 0.65
+      });
+
+      const model = new THREE.Group();
+      // Thân giáp chiến binh
+      const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.22, 0.55, 16), armorMat);
+      torso.position.y = 0.42;
+      torso.castShadow = true;
+      model.add(torso);
+
+      // Áo choàng phía sau
+      const cloak = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.52, 0.05), cloakMat);
+      cloak.position.set(0, 0.4, -0.14);
+      cloak.rotation.x = 0.15;
+      model.add(cloak);
+
+      // Đầu & Mũ giáp đặc trưng theo từng quân cờ để nhận diện ngay lập tức
+      const head = new THREE.Mesh(new THREE.SphereGeometry(0.13, 16, 16), armorMat);
+      head.position.y = 0.82;
+      head.castShadow = true;
+      model.add(head);
+
+      if (type === 'p') {
+        // Tốt: Khiên Scutum chữ nhật đặc trưng của lính Lê Dương
+        const shield = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.46, 0.04), cloakMat);
+        shield.position.set(0.18, 0.42, 0.18);
+        shield.rotation.y = -0.4;
+        model.add(shield);
+      } else if (type === 'r') {
+        // Xe: Tháp công thành có lỗ châu mai trên đỉnh
+        const tower = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.26, 0.85, 8), armorMat);
+        tower.position.y = 0.55;
+        model.add(tower);
+      } else if (type === 'n') {
+        // Mã: Đầu chiến mã + mào lông đỏ/tím
+        const horseHead = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.36, 0.34), armorMat);
+        horseHead.position.set(0, 0.78, 0.14);
+        horseHead.rotation.x = -0.35;
+        model.add(horseHead);
+      } else if (type === 'b') {
+        // Tượng: Quyền trượng gắn ngọc phát sáng
+        const staff = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.02, 1.15, 8), armorMat);
+        staff.position.set(0.25, 0.65, 0.1);
+        const orb = new THREE.Mesh(
+          new THREE.SphereGeometry(0.07, 12, 12),
+          new THREE.MeshStandardMaterial({ color: 0x00e5ff, emissive: 0x0091ea, emissiveIntensity: 1.2 })
+        );
+        orb.position.set(0.25, 1.24, 0.1);
+        model.add(staff, orb);
+      } else if (type === 'q') {
+        // Hậu: Vương miện nguyệt quế + Trường giáo dài
+        const crown = new THREE.Mesh(new THREE.TorusGeometry(0.12, 0.025, 8, 16), armorMat);
+        crown.rotation.x = Math.PI / 2;
+        crown.position.y = 0.96;
+        const spear = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.018, 1.35, 8), armorMat);
+        spear.position.set(0.26, 0.75, 0.1);
+        model.add(crown, spear);
+      } else if (type === 'k') {
+        // Vua: Cao nhất bàn cờ + Vương miện Hoàng Đế + Cờ hiệu đại bàng
+        torso.scale.set(1.2, 1.25, 1.2);
+        head.position.y = 1.02;
+        const crown = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.12, 0.12, 12), armorMat);
+        crown.position.y = 1.16;
+        model.add(crown);
+      }
+      return model;
+    }
+
+    async function preloadAllModels() {
+      const statusEl = document.getElementById('loading-status');
+      let loadedCount = 0;
+
+      const tasks = Object.entries(MODEL_CONFIG).map(([type, cfg]) => {
+        return new Promise((resolve) => {
+          gltfLoader.load(
+            cfg.url,
+            (gltf) => {
+              loadedTemplates[type] = gltf;
+              loadedCount++;
+              resolve();
+            },
+            undefined,
+            () => {
+              // Không tìm thấy file .glb -> tự chuyển sang dùng tượng điêu khắc dự phòng
+              loadedTemplates[type] = null;
+              resolve();
+            }
+          );
+        });
+      });
+
+      await Promise.all(tasks);
+      if (loadedCount > 0) {
+        statusEl.textContent = `Đã nạp ${loadedCount}/6 mô hình 3D (.glb) chất lượng cao!`;
+      } else {
+        statusEl.textContent = `Chế độ Tượng Điêu Khắc La Mã (Đặt file .glb vào thư mục /models để kích hoạt chiến binh thật)`;
+      }
+    }
+
+    // =========================================================================
+    // 5. LOGIC CỜ VUA, DI CHUYỂN & TƯƠNG TÁC NGƯỜI CHƠI
+    // =========================================================================
+    const chess = new Chess();
+    const pieceMeshes = {}; // 'e2' -> Group
+    let selectedSquare = null;
+    let legalMoves = [];
+    let isAnimating = false;
+
+    function buildPieceObject(type, colorSide) {
+      const root = new THREE.Group();
+      const pedestal = createPedestal(type, colorSide);
+      root.add(pedestal);
+
+      const gltf = loadedTemplates[type];
+      if (gltf) {
+        // Clone mô hình .glb thật
+        const model = gltf.scene.clone();
+        const cfg = MODEL_CONFIG[type];
+        model.scale.setScalar(cfg.scale);
+        model.position.y = 0.12;
+        // Xoay mặt đối diện nhau
+        model.rotation.y = colorSide === 'w' ? Math.PI : 0;
+
+        // Phủ ánh sắc phe lên giáp để phân biệt 2 đội
+        model.traverse((child) => {
+          if (child.isMesh) {
+            child.castShadow = true;
+            child.receiveShadow = true;
+            child.material = child.material.clone();
+            if (colorSide === 'b') {
+              child.material.color.multiplyScalar(0.55); // Tông tối cho phe Đế Chế Hắc Ám
+            }
+          }
+        });
+        root.add(model);
+
+        // Kích hoạt hoạt ảnh xương nếu file .glb có sẵn animation
+        if (gltf.animations && gltf.animations.length > 0) {
+          const mixer = new THREE.AnimationMixer(model);
+          const action = mixer.clipAction(gltf.animations[0]);
+          action.play();
+          mixers.push(mixer);
+        }
+      } else {
+        const sculpture = createFallbackSculpture(type, colorSide);
+        sculpture.rotation.y = colorSide === 'w' ? Math.PI : 0;
+        root.add(sculpture);
+      }
+
+      root.userData = { type, color: colorSide };
+      return root;
+    }
+
+    function syncBoardFromChess() {
+      // Xóa quân cũ
+      Object.values(pieceMeshes).forEach(m => scene.remove(m));
+      for (const k in pieceMeshes) delete pieceMeshes[k];
+
+      const board = chess.board();
+      for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+          const cell = board[r][c];
+          if (cell) {
+            const sq = cell.square;
+            const pieceObj = buildPieceObject(cell.type, cell.color);
+            pieceObj.position.set(c - 3.5, 0.06, r - 3.5);
+            pieceObj.userData.square = sq;
+            scene.add(pieceObj);
+            pieceMeshes[sq] = pieceObj;
+          }
+        }
+      }
+      updateStatusUI();
+    }
+
+    function updateStatusUI() {
+      const el = document.getElementById('status-text');
+      if (chess.isCheckmate()) {
+        el.textContent = chess.turn() === 'w' ? 'Thất Bại! Chiếu Bí!' : 'Chiến Thắng Vang Dội!';
+      } else if (chess.isDraw()) {
+        el.textContent = 'Trận Đấu Hòa!';
+      } else {
+        el.textContent = chess.turn() === 'w' ? 'Lượt của Bạn' : 'Đế Chế đang suy tính...';
+      }
+    }
+
+    function clearTileHighlights() {
+      Object.values(tileMeshes).forEach(tile => {
+        tile.material = tile.userData.defaultMat;
+      });
+    }
+
+    function selectSquare(sq) {
+      clearTileHighlights();
+      const piece = chess.get(sq);
+      if (piece && piece.color === 'w' && chess.turn() === 'w') {
+        selectedSquare = sq;
+        legalMoves = chess.moves({ square: sq, verbose: true });
+        tileMeshes[sq].material = highlightMat;
+        legalMoves.forEach(m => {
+          tileMeshes[m.to].material = m.captured ? captureMat : highlightMat;
+        });
+      } else {
+        selectedSquare = null;
+        legalMoves = [];
+      }
+    }
+
+    // Hoạt ảnh di chuyển mượt mà
+    function animateMove(fromSq, toSq, onComplete) {
+      isAnimating = true;
+      const movingPiece = pieceMeshes[fromSq];
+      const targetTile = tileMeshes[toSq];
+      const startPos = movingPiece.position.clone();
+      const endPos = new THREE.Vector3(targetTile.position.x, 0.06, targetTile.position.z);
+
+      let progress = 0;
+      function step() {
+        progress += 0.06;
+        if (progress >= 1) {
+          movingPiece.position.copy(endPos);
+          isAnimating = false;
+          onComplete();
+          return;
+        }
+        movingPiece.position.lerpVectors(startPos, endPos, progress);
+        movingPiece.position.y = 0.06 + Math.sin(progress * Math.PI) * 0.45; // Nhảy nhẹ qua ô cờ
+        requestAnimationFrame(step);
+      }
+      step();
+    }
+
+    function executeMove(moveObj) {
+      clearTileHighlights();
+      selectedSquare = null;
+      animateMove(moveObj.from, moveObj.to, () => {
+        chess.move(moveObj);
+        syncBoardFromChess();
+
+        // Lượt của AI (Quân Đen)
+        if (!chess.isGameOver() && chess.turn() === 'b') {
+          setTimeout(() => {
+            const moves = chess.moves({ verbose: true });
+            if (moves.length > 0) {
+              // Ưu tiên nước ăn quân
+              const captures = moves.filter(m => m.captured);
+              const chosen = captures.length > 0
+                ? captures[Math.floor(Math.random() * captures.length)]
+                : moves[Math.floor(Math.random() * moves.length)];
+              executeMove(chosen);
+            }
+          }, 450);
+        }
+      });
+    }
+
+    // =========================================================================
+    // 6. XỬ LÝ CHUỘT (CLICK CHỌN QUÂN & HOVER HIỂN THỊ VAI TRÒ)
+    // =========================================================================
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    const tooltip = document.getElementById('piece-tooltip');
+
+    window.addEventListener('pointermove', (e) => {
+      mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const piecesList = Object.values(pieceMeshes);
+      const hits = raycaster.intersectObjects(piecesList, true);
+
+      if (hits.length > 0) {
+        let obj = hits[0].object;
+        while (obj.parent && !obj.userData.type) obj = obj.parent;
+        if (obj.userData.type) {
+          const info = MODEL_CONFIG[obj.userData.type];
+          const sideLabel = obj.userData.color === 'w' ? ' [Phe Bạn]' : ' [Phe Địch]';
+          tooltip.innerHTML = `${info.name}${sideLabel}<span>${info.desc}</span>`;
+          tooltip.style.left = `${e.clientX}px`;
+          tooltip.style.top = `${e.clientY}px`;
+          tooltip.style.display = 'block';
+          document.body.style.cursor = 'pointer';
+          return;
+        }
+      }
+      tooltip.style.display = 'none';
+      document.body.style.cursor = 'default';
+    });
+
+    window.addEventListener('pointerdown', (e) => {
+      if (isAnimating || chess.turn() !== 'w' || chess.isGameOver()) return;
+      mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+
+      // Kiểm tra click vào ô cờ hoặc quân cờ
+      const allTargets = [...Object.values(tileMeshes), ...Object.values(pieceMeshes)];
+      const hits = raycaster.intersectObjects(allTargets, true);
+      if (hits.length === 0) return;
+
+      let target = hits[0].object;
+      while (target.parent && !target.userData.square) target = target.parent;
+      const clickedSq = target.userData.square;
+      if (!clickedSq) return;
+
+      // Nếu đang chọn quân và click vào ô đi hợp lệ
+      const validMove = legalMoves.find(m => m.to === clickedSq);
+      if (validMove) {
+        executeMove(validMove);
+      } else {
+        selectSquare(clickedSq);
+      }
+    });
+
+    // Nút điều khiển
+    document.getElementById('btn-reset').addEventListener('click', () => {
+      chess.reset();
+      clearTileHighlights();
+      syncBoardFromChess();
+    });
+
+    let camToggle = false;
+    document.getElementById('btn-camera').addEventListener('click', () => {
+      camToggle = !camToggle;
+      camera.position.set(camToggle ? 11 : 0, camToggle ? 8.5 : 10.5, camToggle ? 7 : 11.5);
+      controls.target.set(0, 0, 0);
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // Vòng lặp Render
+    const clock = new THREE.Clock();
+    function animate() {
+      requestAnimationFrame(animate);
+      const delta = clock.getDelta();
+      const elapsed = clock.getElapsedTime();
+
+      // Cập nhật hoạt ảnh xương (.glb)
+      mixers.forEach(m => m.update(delta));
+
+      // Hiệu ứng lửa chậu bập bùng tự nhiên
+      fireLights.forEach((light, idx) => {
+        light.intensity = 4.2 + Math.sin(elapsed * 8 + idx) * 0.8;
+      });
+
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    // Khởi chạy
+    preloadAllModels().then(() => {
+      syncBoardFromChess();
+      animate();
+    });
+  </script>
+</body>
+</html>

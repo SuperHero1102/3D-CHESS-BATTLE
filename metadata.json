@@ -1,0 +1,6 @@
+{
+  "name": "3D CHESS BATTLE",
+  "description": "Realistic 3D medieval warfare chess game with articulated warriors, 3D capture combat cinematics, AI opponents, online multiplayer, and global leaderboard.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
