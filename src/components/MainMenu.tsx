@@ -30,6 +30,8 @@ interface MainMenuProps {
   onToggleLanguage: () => void;
 }
 
+import { UX_POLISH } from '../config/featureFlags';
+
 export const MainMenu: React.FC<MainMenuProps> = ({
   settings,
   user,
@@ -47,7 +49,13 @@ export const MainMenu: React.FC<MainMenuProps> = ({
   const [showIOSGuide, setShowIOSGuide] = useState(false);
 
   return (
-    <div className="fixed inset-0 z-20 flex flex-col justify-between pointer-events-none p-4 sm:p-6 md:p-8">
+    <div
+      className={`fixed inset-0 z-20 flex flex-col justify-between pointer-events-none p-4 sm:p-6 md:p-8 ${
+        UX_POLISH
+          ? 'pt-[max(1rem,env(safe-area-inset-top))] pb-[max(1rem,env(safe-area-inset-bottom))] overflow-y-auto'
+          : ''
+      }`}
+    >
       {/* Top Bar: Account + Language + Quick Actions */}
       <header className="pointer-events-auto flex flex-wrap items-center justify-between gap-3 max-w-6xl w-full mx-auto">
         <div className="flex items-center gap-3 bg-[#121620]/92 border border-[#D4AF37]/25 rounded-xl px-3.5 py-2 shadow-lg">

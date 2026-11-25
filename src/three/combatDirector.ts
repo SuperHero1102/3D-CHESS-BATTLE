@@ -3,13 +3,24 @@ import { CombatEvent, CombatPace, PieceColor, PieceSymbol } from '../types/chess
 import { squareToWorld } from './arenaBuilder';
 import { PEDESTAL_HEIGHT, WarriorRig, resetPose } from './warriorFactory';
 
+// 1-LINE TOGGLE: Đặt `false` để quay lại hiệu ứng giao chiến cũ
+export const CAPTURE_FX = true;
+
 const _v1 = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
 const _v3 = new THREE.Vector3();
 
-interface ParticleBurst {
+const POOL_BURST_SLOTS = 12;
+const MAX_POOL_POINTS = 96;
+
+interface PooledBurstSlot {
   points: THREE.Points;
+  geo: THREE.BufferGeometry;
+  mat: THREE.PointsMaterial;
+  positions: Float32Array;
   velocities: Float32Array;
+  activeCount: number;
+  inUse: boolean;
   age: number;
   maxAge: number;
   gravity: number;
@@ -42,28 +53,39 @@ interface ActiveCombatAnim {
   defender: WarriorRig;
   startPos: THREE.Vector3;
   targetPos: THREE.Vector3;
+  attackAngle: number;
+  attackerCenterY: number;
+  defenderCenterY: number;
   elapsed: number;
   duration: number;
   hitStopRemaining: number;
   shieldBashFired: boolean;
   impactFired: boolean;
+  knockoutStarted: boolean;
   dissolveStarted: boolean;
   dissolveProgress: DissolveUniform;
   clonedVictimMats: THREE.Material[];
   magicRing?: THREE.Mesh;
   magicBeam?: THREE.Mesh;
-  lightningBolt?: THREE.Mesh;
+  slashArc?: THREE.Mesh;
+  lightningBolt?: THREE.Group;
   flashLight?: THREE.PointLight;
   onComplete: () => void;
 }
 
-function createZigZagLightningGeo(targetWorld: THREE.Vector3): THREE.TubeGeometry {
+function createZigZagBranchGeo(
+  targetWorld: THREE.Vector3,
+  startY: number,
+  endY: number,
+  spread: number,
+  radius: number
+): THREE.TubeGeometry {
   const pts: THREE.Vector3[] = [];
   const steps = 9;
   for (let i = 0; i <= steps; i++) {
     const frac = i / steps;
-    const y = THREE.MathUtils.lerp(4.6, 0.35, frac);
-    const jitter = i === 0 || i === steps ? 0 : 0.24;
+    const y = THREE.MathUtils.lerp(startY, endY, frac);
+    const jitter = i === 0 || i === steps ? 0 : spread;
     pts.push(
       new THREE.Vector3(
         targetWorld.x + (Math.random() - 0.5) * jitter,
@@ -72,18 +94,56 @@ function createZigZagLightningGeo(targetWorld: THREE.Vector3): THREE.TubeGeometr
       )
     );
   }
-  return new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 18, 0.045, 6, false);
+  return new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 18, radius, 6, false);
+}
+
+function createForkedLightningGroup(targetWorld: THREE.Vector3, hitHeight: number): THREE.Group {
+  const grp = new THREE.Group();
+  const mainMat = new THREE.MeshBasicMaterial({
+    color: new THREE.Color(2.6, 2.05, 0.72),
+    transparent: true,
+    opacity: 0.96,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  });
+  const mainGeo = createZigZagBranchGeo(targetWorld, 4.9, Math.max(0.32, hitHeight * 0.55), 0.28, 0.046);
+  grp.add(new THREE.Mesh(mainGeo, mainMat));
+
+  if (CAPTURE_FX) {
+    const forkOffset1 = new THREE.Vector3(targetWorld.x + 0.34, 0, targetWorld.z - 0.26);
+    const forkOffset2 = new THREE.Vector3(targetWorld.x - 0.32, 0, targetWorld.z + 0.28);
+    const fork1 = createZigZagBranchGeo(forkOffset1, 3.3, Math.max(0.18, hitHeight * 0.25), 0.36, 0.024);
+    const fork2 = createZigZagBranchGeo(forkOffset2, 2.9, Math.max(0.15, hitHeight * 0.2), 0.32, 0.022);
+    grp.add(new THREE.Mesh(fork1, mainMat), new THREE.Mesh(fork2, mainMat));
+  }
+  return grp;
+}
+
+function disposeCombatMeshGroup(obj: THREE.Object3D) {
+  obj.traverse((child) => {
+    if (child instanceof THREE.Mesh) {
+      child.geometry.dispose();
+      if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
+      else child.material.dispose();
+    }
+  });
+}
+
+function getRigCenterY(rig: WarriorRig): number {
+  const h = rig.glbNormSize?.[1] ?? Math.max(0.7, rig.headHeight - PEDESTAL_HEIGHT);
+  return PEDESTAL_HEIGHT + h * 0.55;
 }
 
 export class CombatDirector {
   private scene: THREE.Scene;
   private smokeTex?: THREE.Texture;
   private emberTex?: THREE.Texture;
-  private particles: ParticleBurst[] = [];
+  private burstPool: PooledBurstSlot[] = [];
   private shockwaves: ShockwaveRing[] = [];
   private moveAnims: ActiveMoveAnim[] = [];
   private activeCombat: ActiveCombatAnim | null = null;
   public cameraShake = 0;
+  public bloomBoost = 0;
   public lowPerfMode = false;
   public combatCameraTarget: THREE.Vector3 | null = null;
   public combatCameraDesiredPos: THREE.Vector3 | null = null;
@@ -92,10 +152,57 @@ export class CombatDirector {
     this.scene = scene;
     this.smokeTex = textures?.smokeTex;
     this.emberTex = textures?.emberTex;
+
+    for (let i = 0; i < POOL_BURST_SLOTS; i++) {
+      const positions = new Float32Array(MAX_POOL_POINTS * 3);
+      const velocities = new Float32Array(MAX_POOL_POINTS * 3);
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geo.setDrawRange(0, 0);
+      const mat = new THREE.PointsMaterial({
+        map: this.emberTex,
+        color: 0xffffff,
+        size: 0.14,
+        transparent: true,
+        opacity: 1,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+      const points = new THREE.Points(geo, mat);
+      points.visible = false;
+      points.frustumCulled = false;
+      this.scene.add(points);
+      this.burstPool.push({
+        points,
+        geo,
+        mat,
+        positions,
+        velocities,
+        activeCount: 0,
+        inUse: false,
+        age: 0,
+        maxAge: 0.8,
+        gravity: 4.0,
+        initialOpacity: 1,
+      });
+    }
   }
 
   public isBusy(): boolean {
     return this.activeCombat !== null;
+  }
+
+  private acquireBurstSlot(): PooledBurstSlot | null {
+    const free = this.burstPool.find((s) => !s.inUse);
+    if (free) return free;
+    // Recycle oldest active slot when pool is full
+    let oldest = this.burstPool[0];
+    for (let i = 1; i < this.burstPool.length; i++) {
+      if (this.burstPool[i].age > oldest.age) {
+        oldest = this.burstPool[i];
+      }
+    }
+    return oldest || null;
   }
 
   public spawnBurst(
@@ -103,130 +210,119 @@ export class CombatDirector {
     colorHex: number,
     count = 40,
     upward = 2.4,
-    options?: { size?: number; gravity?: number; maxAge?: number; additive?: boolean; spread?: number }
+    options?: { size?: number; gravity?: number; maxAge?: number; additive?: boolean; spread?: number; baseY?: number }
   ) {
-    const cappedCount = this.lowPerfMode ? Math.max(8, Math.floor(count * 0.4)) : count;
-    if (this.particles.length > (this.lowPerfMode ? 8 : 22)) return;
+    const scaled = this.lowPerfMode ? Math.max(8, Math.floor(count * 0.45)) : count;
+    const cappedCount = Math.min(MAX_POOL_POINTS, scaled);
+    const slot = this.acquireBurstSlot();
+    if (!slot) return;
 
-    const positions = new Float32Array(cappedCount * 3);
-    const velocities = new Float32Array(cappedCount * 3);
     const spread = options?.spread ?? 0.22;
+    const baseY = options?.baseY ?? 0.35;
     for (let i = 0; i < cappedCount; i++) {
-      positions[i * 3] = origin.x + (Math.random() - 0.5) * spread;
-      positions[i * 3 + 1] = origin.y + 0.35 + Math.random() * 0.55;
-      positions[i * 3 + 2] = origin.z + (Math.random() - 0.5) * spread;
+      slot.positions[i * 3] = origin.x + (Math.random() - 0.5) * spread;
+      slot.positions[i * 3 + 1] = origin.y + baseY + Math.random() * 0.55;
+      slot.positions[i * 3 + 2] = origin.z + (Math.random() - 0.5) * spread;
 
       const angle = Math.random() * Math.PI * 2;
       const speed = 0.7 + Math.random() * 2.4;
-      velocities[i * 3] = Math.cos(angle) * speed;
-      velocities[i * 3 + 1] = 0.5 + Math.random() * upward;
-      velocities[i * 3 + 2] = Math.sin(angle) * speed;
+      slot.velocities[i * 3] = Math.cos(angle) * speed;
+      slot.velocities[i * 3 + 1] = 0.5 + Math.random() * upward;
+      slot.velocities[i * 3 + 2] = Math.sin(angle) * speed;
     }
 
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    const mat = new THREE.PointsMaterial({
-      map: this.emberTex,
-      color: colorHex,
-      size: (options?.size ?? 0.1) * 1.45,
-      transparent: true,
-      opacity: 1,
-      depthWrite: false,
-      blending: options?.additive === false ? THREE.NormalBlending : THREE.AdditiveBlending,
-    });
+    const posAttr = slot.geo.getAttribute('position') as THREE.BufferAttribute;
+    posAttr.needsUpdate = true;
+    slot.geo.setDrawRange(0, cappedCount);
 
-    const points = new THREE.Points(geo, mat);
-    this.scene.add(points);
-    this.particles.push({
-      points,
-      velocities,
-      age: 0,
-      maxAge: options?.maxAge ?? 0.9,
-      gravity: options?.gravity ?? 4.2,
-      initialOpacity: 1,
-    });
+    slot.mat.map = this.emberTex ?? null;
+    slot.mat.color.setHex(colorHex);
+    slot.mat.size = (options?.size ?? 0.1) * 1.45;
+    slot.mat.blending = options?.additive === false ? THREE.NormalBlending : THREE.AdditiveBlending;
+    slot.mat.opacity = 1;
+    slot.mat.needsUpdate = true;
+
+    slot.activeCount = cappedCount;
+    slot.inUse = true;
+    slot.age = 0;
+    slot.maxAge = options?.maxAge ?? 0.9;
+    slot.gravity = options?.gravity ?? 4.2;
+    slot.initialOpacity = 1;
+    slot.points.visible = true;
   }
 
   public spawnDustPuff(origin: THREE.Vector3, count = 8) {
-    const cappedCount = this.lowPerfMode ? Math.max(3, Math.floor(count * 0.4)) : count;
-    if (this.particles.length > (this.lowPerfMode ? 8 : 22)) return;
+    const scaled = this.lowPerfMode ? Math.max(3, Math.floor(count * 0.45)) : count;
+    const cappedCount = Math.min(MAX_POOL_POINTS, scaled);
+    const slot = this.acquireBurstSlot();
+    if (!slot) return;
 
-    const positions = new Float32Array(cappedCount * 3);
-    const velocities = new Float32Array(cappedCount * 3);
     for (let i = 0; i < cappedCount; i++) {
-      positions[i * 3] = origin.x + (Math.random() - 0.5) * 0.34;
-      positions[i * 3 + 1] = 0.05 + Math.random() * 0.1;
-      positions[i * 3 + 2] = origin.z + (Math.random() - 0.5) * 0.34;
+      slot.positions[i * 3] = origin.x + (Math.random() - 0.5) * 0.34;
+      slot.positions[i * 3 + 1] = 0.05 + Math.random() * 0.1;
+      slot.positions[i * 3 + 2] = origin.z + (Math.random() - 0.5) * 0.34;
 
       const angle = Math.random() * Math.PI * 2;
       const speed = 0.25 + Math.random() * 0.65;
-      velocities[i * 3] = Math.cos(angle) * speed;
-      velocities[i * 3 + 1] = 0.32 + Math.random() * 0.42;
-      velocities[i * 3 + 2] = Math.sin(angle) * speed;
+      slot.velocities[i * 3] = Math.cos(angle) * speed;
+      slot.velocities[i * 3 + 1] = 0.32 + Math.random() * 0.42;
+      slot.velocities[i * 3 + 2] = Math.sin(angle) * speed;
     }
 
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    const mat = new THREE.PointsMaterial({
-      map: this.smokeTex,
-      color: 0xd4cab8,
-      size: 0.4,
-      transparent: true,
-      opacity: 0.4,
-      depthWrite: false,
-      blending: THREE.NormalBlending,
-    });
+    const posAttr = slot.geo.getAttribute('position') as THREE.BufferAttribute;
+    posAttr.needsUpdate = true;
+    slot.geo.setDrawRange(0, cappedCount);
 
-    const points = new THREE.Points(geo, mat);
-    this.scene.add(points);
-    this.particles.push({
-      points,
-      velocities,
-      age: 0,
-      maxAge: 0.5,
-      gravity: 0.35,
-      initialOpacity: 0.44,
-    });
+    slot.mat.map = this.smokeTex ?? null;
+    slot.mat.color.setHex(0xd4cab8);
+    slot.mat.size = 0.4;
+    slot.mat.blending = THREE.NormalBlending;
+    slot.mat.opacity = 0.42;
+    slot.mat.needsUpdate = true;
+
+    slot.activeCount = cappedCount;
+    slot.inUse = true;
+    slot.age = 0;
+    slot.maxAge = 0.5;
+    slot.gravity = 0.35;
+    slot.initialOpacity = 0.44;
+    slot.points.visible = true;
   }
 
   public spawnAshDissolve(origin: THREE.Vector3) {
-    const count = this.lowPerfMode ? 24 : 62;
-    const positions = new Float32Array(count * 3);
-    const velocities = new Float32Array(count * 3);
-    for (let i = 0; i < count; i++) {
-      positions[i * 3] = origin.x + (Math.random() - 0.5) * 0.46;
-      positions[i * 3 + 1] = 0.14 + Math.random() * 1.1;
-      positions[i * 3 + 2] = origin.z + (Math.random() - 0.5) * 0.46;
+    const cappedCount = Math.min(MAX_POOL_POINTS, this.lowPerfMode ? 24 : 58);
+    const slot = this.acquireBurstSlot();
+    if (slot) {
+      for (let i = 0; i < cappedCount; i++) {
+        slot.positions[i * 3] = origin.x + (Math.random() - 0.5) * 0.46;
+        slot.positions[i * 3 + 1] = 0.14 + Math.random() * 1.1;
+        slot.positions[i * 3 + 2] = origin.z + (Math.random() - 0.5) * 0.46;
 
-      const angle = Math.random() * Math.PI * 2;
-      const drift = 0.18 + Math.random() * 0.65;
-      velocities[i * 3] = Math.cos(angle) * drift;
-      velocities[i * 3 + 1] = 0.8 + Math.random() * 1.45;
-      velocities[i * 3 + 2] = Math.sin(angle) * drift;
+        const angle = Math.random() * Math.PI * 2;
+        const drift = 0.18 + Math.random() * 0.65;
+        slot.velocities[i * 3] = Math.cos(angle) * drift;
+        slot.velocities[i * 3 + 1] = 0.8 + Math.random() * 1.45;
+        slot.velocities[i * 3 + 2] = Math.sin(angle) * drift;
+      }
+      const posAttr = slot.geo.getAttribute('position') as THREE.BufferAttribute;
+      posAttr.needsUpdate = true;
+      slot.geo.setDrawRange(0, cappedCount);
+
+      slot.mat.map = this.smokeTex ?? null;
+      slot.mat.color.setHex(0xa1a8b5);
+      slot.mat.size = 0.28;
+      slot.mat.blending = THREE.NormalBlending;
+      slot.mat.opacity = 0.85;
+      slot.mat.needsUpdate = true;
+
+      slot.activeCount = cappedCount;
+      slot.inUse = true;
+      slot.age = 0;
+      slot.maxAge = 1.0;
+      slot.gravity = -0.4;
+      slot.initialOpacity = 0.85;
+      slot.points.visible = true;
     }
-
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    const mat = new THREE.PointsMaterial({
-      map: this.smokeTex,
-      color: 0xa1a8b5,
-      size: 0.28,
-      transparent: true,
-      opacity: 0.88,
-      depthWrite: false,
-      blending: THREE.NormalBlending,
-    });
-
-    const points = new THREE.Points(geo, mat);
-    this.scene.add(points);
-    this.particles.push({
-      points,
-      velocities,
-      age: 0,
-      maxAge: 1.05,
-      gravity: -0.4,
-      initialOpacity: 0.88,
-    });
 
     this.spawnBurst(origin, 0xff8c2b, 28, 2.1, {
       size: 0.085,
@@ -255,20 +351,31 @@ export class CombatDirector {
   }
 
   public queueSimpleMove(rig: WarriorRig, fromSq: string, toSq: string, type: PieceSymbol) {
+    for (let i = this.moveAnims.length - 1; i >= 0; i--) {
+      if (this.moveAnims[i].rig === rig) {
+        this.moveAnims.splice(i, 1);
+      }
+    }
     const startPos = squareToWorld(fromSq, new THREE.Vector3());
     const endPos = squareToWorld(toSq, new THREE.Vector3());
     const dx = endPos.x - startPos.x;
     const dz = endPos.z - startPos.z;
+    const dist = Math.hypot(dx, dz);
     if (Math.abs(dx) + Math.abs(dz) > 0.01) {
       rig.bodyGroup.rotation.y = Math.atan2(dx, dz);
     }
     this.spawnDustPuff(startPos, 8);
+    const proportionalDur = CAPTURE_FX
+      ? THREE.MathUtils.clamp((type === 'n' ? 0.42 : 0.28) + dist * 0.045, 0.28, 0.62)
+      : type === 'n'
+        ? 0.56
+        : 0.42;
     this.moveAnims.push({
       rig,
       startPos,
       endPos,
       progress: 0,
-      duration: type === 'n' ? 0.56 : 0.42,
+      duration: proportionalDur,
       isKnight: type === 'n',
       dustTimer: 0,
     });
@@ -281,14 +388,24 @@ export class CombatDirector {
     pace: CombatPace,
     onComplete: () => void
   ) {
+    for (let i = this.moveAnims.length - 1; i >= 0; i--) {
+      const anim = this.moveAnims[i];
+      if (anim.rig === attacker || anim.rig === defender) {
+        anim.rig.root.position.copy(anim.endPos);
+        this.moveAnims.splice(i, 1);
+      }
+    }
     const startPos = squareToWorld(event.from, new THREE.Vector3());
     const targetPos = squareToWorld(event.to, new THREE.Vector3());
+    attacker.root.position.copy(startPos);
+    defender.root.position.copy(targetPos);
 
     if (pace === 'off') {
       attacker.root.position.copy(targetPos);
       resetPose(attacker.root);
+      attacker.bodyGroup.rotation.y = event.attackerColor === 'w' ? Math.PI : 0;
       this.spawnBurst(targetPos, 0xffd166, 26);
-      this.spawnAshDissolve(targetPos);
+      this.spawnDustPuff(targetPos, 10);
       onComplete();
       return;
     }
@@ -301,10 +418,13 @@ export class CombatDirector {
     attacker.bodyGroup.rotation.y = attackAngle;
     defender.bodyGroup.rotation.y = attackAngle + Math.PI;
 
+    const attackerCenterY = getRigCenterY(attacker);
+    const defenderCenterY = getRigCenterY(defender);
+
     const mid = new THREE.Vector3().lerpVectors(startPos, targetPos, 0.65);
     const perp = new THREE.Vector3(-dz, 0, dx).normalize();
     if (perp.lengthSq() < 0.01) perp.set(1, 0, 0);
-    this.combatCameraTarget = new THREE.Vector3(mid.x, 0.78, mid.z);
+    this.combatCameraTarget = new THREE.Vector3(mid.x, Math.max(0.68, (attackerCenterY + defenderCenterY) * 0.5), mid.z);
     this.combatCameraDesiredPos = new THREE.Vector3(
       mid.x + perp.x * 3.1 - (dx === 0 && dz === 0 ? 0 : Math.sign(dx) * 0.65),
       2.35,
@@ -314,7 +434,8 @@ export class CombatDirector {
     const accentHex = event.attackerColor === 'w' ? 0xffc646 : 0xb26bff;
     let magicRing: THREE.Mesh | undefined;
     let magicBeam: THREE.Mesh | undefined;
-    let lightningBolt: THREE.Mesh | undefined;
+    let slashArc: THREE.Mesh | undefined;
+    let lightningBolt: THREE.Group | undefined;
     let flashLight: THREE.PointLight | undefined;
 
     if (event.attackerType === 'b' || event.attackerType === 'q' || event.attackerType === 'k') {
@@ -333,6 +454,21 @@ export class CombatDirector {
       this.scene.add(magicRing);
     }
 
+    if (event.attackerType === 'p' && CAPTURE_FX) {
+      const arcGeo = new THREE.RingGeometry(0.42, 0.68, 24, 1, -Math.PI * 0.35, Math.PI * 0.7);
+      const arcMat = new THREE.MeshBasicMaterial({
+        color: accentHex,
+        transparent: true,
+        opacity: 0.9,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+      slashArc = new THREE.Mesh(arcGeo, arcMat);
+      slashArc.visible = false;
+      this.scene.add(slashArc);
+    }
+
     if (event.attackerType === 'b') {
       const beamGeo = new THREE.CylinderGeometry(0.055, 0.11, 1.0, 12);
       beamGeo.rotateX(Math.PI / 2);
@@ -348,23 +484,15 @@ export class CombatDirector {
       this.scene.add(magicBeam);
 
       flashLight = new THREE.PointLight(accentHex, 0, 7, 1.5);
-      flashLight.position.set(startPos.x, 1.35, startPos.z);
+      flashLight.position.set(startPos.x, attackerCenterY + 0.3, startPos.z);
       this.scene.add(flashLight);
     } else if (event.attackerType === 'k') {
-      const boltGeo = createZigZagLightningGeo(targetPos);
-      const boltMat = new THREE.MeshBasicMaterial({
-        color: new THREE.Color(2.4, 1.9, 0.7),
-        transparent: true,
-        opacity: 0.96,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      });
-      lightningBolt = new THREE.Mesh(boltGeo, boltMat);
+      lightningBolt = createForkedLightningGroup(targetPos, defenderCenterY);
       lightningBolt.visible = false;
       this.scene.add(lightningBolt);
 
       flashLight = new THREE.PointLight(0xffe07a, 0, 9, 1.4);
-      flashLight.position.set(targetPos.x, 1.8, targetPos.z);
+      flashLight.position.set(targetPos.x, defenderCenterY + 0.8, targetPos.z);
       this.scene.add(flashLight);
     }
 
@@ -374,20 +502,46 @@ export class CombatDirector {
       defender,
       startPos,
       targetPos,
+      attackAngle,
+      attackerCenterY,
+      defenderCenterY,
       elapsed: 0,
       duration,
       hitStopRemaining: 0,
       shieldBashFired: false,
       impactFired: false,
+      knockoutStarted: false,
       dissolveStarted: false,
       dissolveProgress: { value: 0 },
       clonedVictimMats: [],
       magicRing,
       magicBeam,
+      slashArc,
       lightningBolt,
       flashLight,
       onComplete,
     };
+  }
+
+  private prepareVictimKnockoutMaterials(combat: ActiveCombatAnim) {
+    combat.defender.root.traverse((obj) => {
+      if (!(obj instanceof THREE.Mesh) || !obj.visible) return;
+      const orig = obj.material;
+      if (Array.isArray(orig)) {
+        const clonedArr = orig.map((m) => {
+          const c = m.clone();
+          c.transparent = true;
+          combat.clonedVictimMats.push(c);
+          return c;
+        });
+        obj.material = clonedArr;
+      } else {
+        const c = orig.clone();
+        c.transparent = true;
+        obj.material = c;
+        combat.clonedVictimMats.push(c);
+      }
+    });
   }
 
   private applyVictimAshDissolveShader(combat: ActiveCombatAnim) {
@@ -427,7 +581,7 @@ export class CombatDirector {
     this.finishCombat(this.activeCombat);
   }
 
-  private finishCombat(combat: ActiveCombatAnim) {
+  private cleanupCombatResources(combat: ActiveCombatAnim) {
     if (combat.magicRing) {
       this.scene.remove(combat.magicRing);
       combat.magicRing.geometry.dispose();
@@ -438,10 +592,14 @@ export class CombatDirector {
       combat.magicBeam.geometry.dispose();
       (combat.magicBeam.material as THREE.Material).dispose();
     }
+    if (combat.slashArc) {
+      this.scene.remove(combat.slashArc);
+      combat.slashArc.geometry.dispose();
+      (combat.slashArc.material as THREE.Material).dispose();
+    }
     if (combat.lightningBolt) {
       this.scene.remove(combat.lightningBolt);
-      combat.lightningBolt.geometry.dispose();
-      (combat.lightningBolt.material as THREE.Material).dispose();
+      disposeCombatMeshGroup(combat.lightningBolt);
     }
     if (combat.flashLight) {
       this.scene.remove(combat.flashLight);
@@ -449,6 +607,11 @@ export class CombatDirector {
     for (const m of combat.clonedVictimMats) {
       m.dispose();
     }
+    combat.clonedVictimMats.length = 0;
+  }
+
+  private finishCombat(combat: ActiveCombatAnim) {
+    this.cleanupCombatResources(combat);
 
     combat.attacker.root.position.copy(combat.targetPos);
     resetPose(combat.attacker.root);
@@ -460,13 +623,48 @@ export class CombatDirector {
     combat.onComplete();
   }
 
+  public cancelAll() {
+    if (this.activeCombat) {
+      const c = this.activeCombat;
+      this.cleanupCombatResources(c);
+      this.activeCombat = null;
+    }
+    this.moveAnims.length = 0;
+    for (let i = this.shockwaves.length - 1; i >= 0; i--) {
+      const sw = this.shockwaves[i];
+      this.scene.remove(sw.mesh);
+      sw.mesh.geometry.dispose();
+      (sw.mesh.material as THREE.Material).dispose();
+    }
+    this.shockwaves.length = 0;
+    for (const slot of this.burstPool) {
+      slot.inUse = false;
+      slot.points.visible = false;
+      slot.geo.setDrawRange(0, 0);
+    }
+    this.combatCameraTarget = null;
+    this.combatCameraDesiredPos = null;
+    this.cameraShake = 0;
+    this.bloomBoost = 0;
+  }
+
+  public dispose() {
+    this.cancelAll();
+    for (const slot of this.burstPool) {
+      this.scene.remove(slot.points);
+      slot.geo.dispose();
+      slot.mat.dispose();
+    }
+    this.burstPool.length = 0;
+  }
+
   public resetRigPose(rig: WarriorRig, color: PieceColor) {
     resetPose(rig.root);
     rig.bodyGroup.rotation.y = color === 'w' ? Math.PI : 0;
   }
 
   public update(delta: number, elapsedTime: number, allRigs: WarriorRig[]) {
-    const dt = Math.min(delta, 0.05);
+    const dt = Math.min(delta, 0.65);
 
     // 1. Living Roman Battlefield Idle Breathing (unique random phase per warrior)
     for (let i = 0; i < allRigs.length; i++) {
@@ -546,7 +744,10 @@ export class CombatDirector {
       }
 
       if (anim.rig.isGlb) {
-        anim.rig.root.position.y = Math.sin(t * Math.PI) * (anim.isKnight ? 0.65 : 0.35);
+        anim.rig.root.position.y = Math.sin(t * Math.PI) * (anim.isKnight ? 0.68 : 0.28);
+        if (CAPTURE_FX) {
+          anim.rig.bodyGroup.rotation.x = Math.sin(t * Math.PI) * (anim.isKnight ? 0.16 : 0.1);
+        }
       } else if (anim.isKnight && anim.rig.horseLegs && anim.rig.horseGroup) {
         anim.rig.root.position.y = Math.sin(t * Math.PI) * 0.72;
         anim.rig.horseGroup.rotation.x = -0.18 + Math.cos(t * Math.PI) * 0.25;
@@ -587,7 +788,7 @@ export class CombatDirector {
       }
     }
 
-    // 3. Stage 5: 6 Unique 3-Phase Capture Finishers + Hit-Stop Slow-Mo + Victim Dissolve
+    // 3. 6 Unique 3-Phase Capture Finishers + Hit-Stop Slow-Mo + Parabolic Knock-Out Ejection
     if (this.activeCombat) {
       const c = this.activeCombat;
       let combatDt = dt;
@@ -611,6 +812,7 @@ export class CombatDirector {
         const p = u / 0.38;
         if (aType === 'b') {
           c.attacker.root.position.lerpVectors(c.startPos, _v2, p * 0.45);
+          c.attacker.bodyGroup.rotation.x = -p * 0.12;
           c.attacker.rightArmPivot.rotation.x = THREE.MathUtils.lerp(-0.28, -1.55, p);
           c.attacker.rightForearmPivot.rotation.x = THREE.MathUtils.lerp(-0.72, -0.2, p);
           if (c.magicRing) {
@@ -619,11 +821,12 @@ export class CombatDirector {
             c.magicRing.scale.setScalar(0.65 + p * 0.85);
           }
           if (c.flashLight) {
-            c.flashLight.position.set(c.attacker.root.position.x, 1.35, c.attacker.root.position.z);
+            c.flashLight.position.set(c.attacker.root.position.x, c.attackerCenterY + 0.3, c.attacker.root.position.z);
             c.flashLight.intensity = p * 5.0;
           }
         } else if (aType === 'k') {
           c.attacker.root.position.lerpVectors(c.startPos, _v2, p * 0.65);
+          c.attacker.bodyGroup.rotation.x = -p * 0.14;
           const stride = Math.sin(p * Math.PI * 3.5) * 0.4;
           c.attacker.leftLegPivot.rotation.x = stride;
           c.attacker.rightLegPivot.rotation.x = -stride;
@@ -646,6 +849,10 @@ export class CombatDirector {
           }
         } else {
           c.attacker.root.position.lerpVectors(c.startPos, _v2, p);
+          if (aType === 'n') {
+            c.attacker.root.position.y = Math.abs(Math.sin(p * Math.PI * 2.2)) * 0.28;
+            c.attacker.bodyGroup.rotation.x = Math.sin(p * Math.PI) * 0.18;
+          }
           if (aType === 'n' && c.attacker.horseLegs && c.attacker.horseGroup) {
             const g = Math.sin(p * Math.PI * 5) * 0.62;
             c.attacker.horseGroup.rotation.x = -0.22 - Math.sin(p * Math.PI) * 0.35;
@@ -653,22 +860,21 @@ export class CombatDirector {
             c.attacker.horseLegs.fr.rotation.x = -0.45 + g * 0.9;
             c.attacker.horseLegs.bl.rotation.x = 0.25 - g;
             c.attacker.horseLegs.br.rotation.x = 0.25 - g * 0.9;
-            c.attacker.root.position.y = Math.abs(Math.sin(p * Math.PI * 2.2)) * 0.22;
             c.attacker.rightArmPivot.rotation.x = THREE.MathUtils.lerp(-0.62, -1.9, p);
           } else {
             const stride = Math.sin(p * Math.PI * 4.5) * 0.54;
             c.attacker.leftLegPivot.rotation.x = stride;
             c.attacker.rightLegPivot.rotation.x = -stride;
             if (aType === 'r') {
-              // Rook winds two-handed hammer overhead
+              c.attacker.bodyGroup.rotation.x = -p * 0.2;
               c.attacker.rightArmPivot.rotation.x = THREE.MathUtils.lerp(-0.42, -2.55, p);
               c.attacker.leftArmPivot.rotation.x = THREE.MathUtils.lerp(-0.56, -2.4, p);
             } else if (aType === 'p') {
-              // Pawn raises Scutum shield in front for shield bash
+              c.attacker.bodyGroup.rotation.x = p * 0.15;
               c.attacker.leftArmPivot.rotation.x = THREE.MathUtils.lerp(-0.32, -1.25, p);
               c.attacker.rightArmPivot.rotation.x = THREE.MathUtils.lerp(-0.22, -1.1, p);
             } else if (aType === 'q') {
-              // Queen begins agile dash + spin
+              c.attacker.bodyGroup.rotation.x = p * 0.14;
               c.attacker.rightArmPivot.rotation.x = THREE.MathUtils.lerp(-0.26, -1.65, p);
             }
           }
@@ -679,28 +885,40 @@ export class CombatDirector {
         const p = (u - 0.38) / 0.3;
 
         if (aType === 'p') {
-          // Pawn: 1) Shield bash slam + spark, 2) Rapid Gladius lunge thrust!
           if (p < 0.45) {
             const sp = p / 0.45;
+            c.attacker.bodyGroup.rotation.x = THREE.MathUtils.lerp(0.15, 0.32, sp);
             c.attacker.leftArmPivot.rotation.x = THREE.MathUtils.lerp(-1.25, -0.35, sp);
             c.attacker.torso.rotation.y = THREE.MathUtils.lerp(0, -0.45, sp);
             if (sp > 0.7 && !c.shieldBashFired) {
               c.shieldBashFired = true;
-              this.spawnBurst(c.targetPos, 0xffd27d, 18, 1.5, { size: 0.08, maxAge: 0.45 });
+              this.spawnBurst(c.targetPos, 0xffd27d, 20, 1.6, {
+                size: 0.085,
+                maxAge: 0.45,
+                baseY: c.defenderCenterY * 0.7,
+              });
             }
           } else {
             const tp = (p - 0.45) / 0.55;
+            c.attacker.bodyGroup.rotation.x = THREE.MathUtils.lerp(0.32, -0.05, tp);
             c.attacker.torso.rotation.y = THREE.MathUtils.lerp(-0.45, 0.35, tp);
             c.attacker.rightArmPivot.rotation.x = THREE.MathUtils.lerp(-1.1, -1.65, tp);
             c.attacker.rightForearmPivot.rotation.x = THREE.MathUtils.lerp(-0.35, 0.25, tp);
+            if (c.slashArc) {
+              c.slashArc.visible = true;
+              c.slashArc.position.set(c.targetPos.x, c.defenderCenterY, c.targetPos.z);
+              c.slashArc.rotation.set(0.45, c.attackAngle, -0.6 + tp * 1.9);
+              c.slashArc.scale.setScalar(0.85 + tp * 0.65);
+            }
           }
         } else if (aType === 'r') {
-          // Rook: Crushing overhead two-handed Warhammer smash!
+          c.attacker.bodyGroup.rotation.x = THREE.MathUtils.lerp(-0.2, 0.34, p);
           c.attacker.rightArmPivot.rotation.x = THREE.MathUtils.lerp(-2.55, 0.22, p);
           c.attacker.leftArmPivot.rotation.x = THREE.MathUtils.lerp(-2.4, 0.15, p);
           c.attacker.torso.rotation.x = Math.sin(p * Math.PI) * 0.35;
         } else if (aType === 'n') {
-          // Knight: Horse rears dramatically, then downward spear thrust as hooves slam!
+          c.attacker.bodyGroup.rotation.x = p < 0.45 ? -0.32 : THREE.MathUtils.lerp(-0.32, 0.28, (p - 0.45) / 0.55);
+          c.attacker.root.position.y = Math.sin(p * Math.PI) * 0.42;
           if (c.attacker.horseGroup && c.attacker.horseLegs) {
             const rearCurve = p < 0.45 ? -0.78 : THREE.MathUtils.lerp(-0.78, -0.25, (p - 0.45) / 0.55);
             c.attacker.horseGroup.rotation.x = rearCurve;
@@ -709,11 +927,10 @@ export class CombatDirector {
           }
           c.attacker.rightArmPivot.rotation.x = THREE.MathUtils.lerp(-1.9, 0.15, p);
         } else if (aType === 'b') {
-          // Bishop: Crystal staff burst + luminous energy beam shooting into victim!
           if (c.magicBeam) {
             c.magicBeam.visible = true;
-            _v3.set(c.attacker.root.position.x, 1.18, c.attacker.root.position.z);
-            const targetPt = new THREE.Vector3(c.targetPos.x, 0.72, c.targetPos.z);
+            _v3.set(c.attacker.root.position.x, c.attackerCenterY, c.attacker.root.position.z);
+            const targetPt = new THREE.Vector3(c.targetPos.x, c.defenderCenterY, c.targetPos.z);
             c.magicBeam.position.lerpVectors(_v3, targetPt, 0.5);
             c.magicBeam.scale.set(1, 1, _v3.distanceTo(targetPt) * Math.min(1, p * 2.2));
             c.magicBeam.lookAt(targetPt);
@@ -722,50 +939,116 @@ export class CombatDirector {
             c.flashLight.intensity = 9.0 * (1 - p * 0.4);
           }
         } else if (aType === 'q') {
-          // Queen: 360° martial spin with golden spear sweep + forward lunge!
+          c.attacker.bodyGroup.rotation.y = c.attackAngle + p * Math.PI * 2;
           c.attacker.torso.rotation.y = p * Math.PI * 2;
           c.attacker.rightArmPivot.rotation.x = THREE.MathUtils.lerp(-1.65, -0.35, p);
+          if (c.magicRing) {
+            c.magicRing.position.set(c.attacker.root.position.x, c.defenderCenterY * 0.72, c.attacker.root.position.z);
+            c.magicRing.rotation.z += dt * 11;
+            c.magicRing.scale.setScalar(1.0 + p * 0.9);
+          }
           if (!this.lowPerfMode && Math.random() < 0.55) {
-            this.spawnBurst(c.attacker.root.position, accentHex, 5, 1.2, { size: 0.08, maxAge: 0.4 });
+            this.spawnBurst(c.attacker.root.position, accentHex, 6, 1.3, {
+              size: 0.085,
+              maxAge: 0.4,
+              baseY: c.attackerCenterY * 0.75,
+            });
           }
         } else if (aType === 'k') {
-          // King: Raises Aquila & summons golden lightning bolt from sky!
           if (c.lightningBolt) {
             c.lightningBolt.visible = p > 0.25;
             c.lightningBolt.rotation.y += dt * 16;
           }
           if (c.flashLight) {
-            c.flashLight.intensity = p > 0.25 ? 14.0 * Math.sin(p * Math.PI) : 2.0;
+            c.flashLight.intensity = p > 0.25 ? 14.5 * Math.sin(p * Math.PI) : 2.0;
           }
         }
 
         if (p > 0.52 && !c.impactFired) {
           c.impactFired = true;
-          c.hitStopRemaining = 0.15; // Brief dramatic hit-stop slow-mo (~0.15s)
-          this.spawnBurst(c.targetPos, 0xfff3b0, 40, 3.1, { size: 0.11, maxAge: 0.68 });
-          this.spawnBurst(c.targetPos, accentHex, 34, 2.6, { size: 0.1, maxAge: 0.85 });
+          c.hitStopRemaining = 0.15;
+          this.bloomBoost = aType === 'k' ? 0.7 : aType === 'r' || aType === 'q' ? 0.52 : 0.35;
+          this.spawnBurst(c.targetPos, 0xfff3b0, 42, 3.1, {
+            size: 0.115,
+            maxAge: 0.68,
+            baseY: c.defenderCenterY * 0.75,
+          });
+          this.spawnBurst(c.targetPos, accentHex, 36, 2.6, {
+            size: 0.1,
+            maxAge: 0.85,
+            baseY: c.defenderCenterY * 0.75,
+          });
           this.spawnShockwave(c.targetPos, accentHex);
+          if (aType === 'r' && CAPTURE_FX) {
+            this.spawnShockwave(c.targetPos, 0xffd166);
+          }
           this.cameraShake = aType === 'r' || aType === 'k' ? 0.18 : aType === 'q' || aType === 'n' ? 0.1 : 0.065;
         }
       } else {
-        // PHASE 3: VICTIM RECOIL + ASH DISSOLVE + ATTACKER CLAIMS SQUARE
+        // PHASE 3: PARABOLIC KNOCK-OUT EJECTION OFF THE BOARD + ATTACKER CLAIMS SQUARE
+        if (!c.impactFired) {
+          c.impactFired = true;
+          this.bloomBoost = aType === 'k' ? 0.7 : aType === 'r' || aType === 'q' ? 0.52 : 0.35;
+          this.spawnBurst(c.targetPos, 0xfff3b0, 42, 3.1, {
+            size: 0.115,
+            maxAge: 0.68,
+            baseY: c.defenderCenterY * 0.75,
+          });
+          this.spawnBurst(c.targetPos, accentHex, 36, 2.6, {
+            size: 0.1,
+            maxAge: 0.85,
+            baseY: c.defenderCenterY * 0.75,
+          });
+          this.spawnShockwave(c.targetPos, accentHex);
+          if (aType === 'r' && CAPTURE_FX) {
+            this.spawnShockwave(c.targetPos, 0xffd166);
+          }
+          this.cameraShake = aType === 'r' || aType === 'k' ? 0.18 : aType === 'q' || aType === 'n' ? 0.1 : 0.065;
+        }
         const p = (u - 0.68) / 0.32;
         if (c.magicBeam) c.magicBeam.visible = false;
+        if (c.slashArc) c.slashArc.visible = false;
         if (c.lightningBolt) c.lightningBolt.visible = false;
         if (c.flashLight) c.flashLight.intensity = Math.max(0, c.flashLight.intensity * (1 - p));
 
-        if (!c.dissolveStarted) {
-          c.dissolveStarted = true;
-          this.applyVictimAshDissolveShader(c);
-          this.spawnAshDissolve(c.targetPos);
+        if (CAPTURE_FX) {
+          if (!c.knockoutStarted) {
+            c.knockoutStarted = true;
+            this.prepareVictimKnockoutMaterials(c);
+            this.spawnDustPuff(c.targetPos, 10);
+          }
+          const flyDist = 5.4 * p;
+          const arcY = Math.max(-1.6, 5.2 * p - 6.8 * p * p);
+          c.defender.root.position.set(
+            c.targetPos.x + _v1.x * flyDist,
+            arcY,
+            c.targetPos.z + _v1.z * flyDist
+          );
+          c.defender.bodyGroup.rotation.x = p * Math.PI * 1.65;
+          c.defender.bodyGroup.rotation.z = p * Math.PI * 1.1;
+          c.defender.root.scale.setScalar(Math.max(0.42, 1 - p * 0.52));
+          const fadeOpacity = Math.max(0, 1 - p * p);
+          for (const m of c.clonedVictimMats) {
+            m.opacity = fadeOpacity;
+          }
+        } else {
+          if (!c.dissolveStarted) {
+            c.dissolveStarted = true;
+            this.applyVictimAshDissolveShader(c);
+            this.spawnAshDissolve(c.targetPos);
+          }
+          c.dissolveProgress.value = p;
+          c.defender.root.position.y = Math.sin(Math.min(1, p * 1.25) * Math.PI) * 0.22;
+          c.defender.bodyGroup.rotation.x = -p * 0.85;
         }
-        c.dissolveProgress.value = p;
-
-        // Victim recoil stagger backward while dissolving
-        c.defender.root.position.y = Math.sin(Math.min(1, p * 1.25) * Math.PI) * 0.22;
-        c.defender.bodyGroup.rotation.x = -p * 0.85;
 
         c.attacker.root.position.lerpVectors(_v2, c.targetPos, p);
+        c.attacker.bodyGroup.rotation.x = THREE.MathUtils.lerp(c.attacker.bodyGroup.rotation.x, 0, p);
+        c.attacker.bodyGroup.rotation.y = THREE.MathUtils.lerp(
+          c.attacker.bodyGroup.rotation.y,
+          c.event.attackerColor === 'w' ? Math.PI : 0,
+          p
+        );
         c.attacker.torso.rotation.y = THREE.MathUtils.lerp(c.attacker.torso.rotation.y, 0, p);
         c.attacker.torso.rotation.x = THREE.MathUtils.lerp(c.attacker.torso.rotation.x, 0, p);
       }
@@ -775,27 +1058,24 @@ export class CombatDirector {
       }
     }
 
-    // 4. Pooled Particle Bursts, Dust & Ash
-    for (let i = this.particles.length - 1; i >= 0; i--) {
-      const b = this.particles[i];
-      b.age += dt;
-      const posAttr = b.points.geometry.getAttribute('position') as THREE.BufferAttribute;
-      const arr = posAttr.array as Float32Array;
-      for (let j = 0; j < posAttr.count; j++) {
-        arr[j * 3] += b.velocities[j * 3] * dt;
-        arr[j * 3 + 1] += b.velocities[j * 3 + 1] * dt;
-        arr[j * 3 + 2] += b.velocities[j * 3 + 2] * dt;
-        b.velocities[j * 3 + 1] -= b.gravity * dt;
+    // 4. Pre-allocated Pooled Particle Bursts, Dust & Ash (Zero per-combat GC churn)
+    for (let i = 0; i < this.burstPool.length; i++) {
+      const slot = this.burstPool[i];
+      if (!slot.inUse) continue;
+      slot.age += dt;
+      for (let j = 0; j < slot.activeCount; j++) {
+        slot.positions[j * 3] += slot.velocities[j * 3] * dt;
+        slot.positions[j * 3 + 1] += slot.velocities[j * 3 + 1] * dt;
+        slot.positions[j * 3 + 2] += slot.velocities[j * 3 + 2] * dt;
+        slot.velocities[j * 3 + 1] -= slot.gravity * dt;
       }
-      posAttr.needsUpdate = true;
-      (b.points.material as THREE.PointsMaterial).opacity =
-        Math.max(0, 1 - b.age / b.maxAge) * b.initialOpacity;
+      (slot.geo.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
+      slot.mat.opacity = Math.max(0, 1 - slot.age / slot.maxAge) * slot.initialOpacity;
 
-      if (b.age >= b.maxAge) {
-        this.scene.remove(b.points);
-        b.points.geometry.dispose();
-        (b.points.material as THREE.Material).dispose();
-        this.particles.splice(i, 1);
+      if (slot.age >= slot.maxAge) {
+        slot.inUse = false;
+        slot.points.visible = false;
+        slot.geo.setDrawRange(0, 0);
       }
     }
 
@@ -816,6 +1096,9 @@ export class CombatDirector {
 
     if (this.cameraShake > 0) {
       this.cameraShake = Math.max(0, this.cameraShake - dt * 0.45);
+    }
+    if (this.bloomBoost > 0) {
+      this.bloomBoost = Math.max(0, this.bloomBoost - dt * 1.45);
     }
   }
 }

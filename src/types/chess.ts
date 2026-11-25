@@ -89,6 +89,10 @@ export interface OnlineRoomState {
     b: OnlinePlayer | null;
   };
   timeControl: TimeControl;
+  turnMinutes?: number;
+  turnDeadlineAt?: number | null;
+  hostColor?: PieceColor;
+  hostSideChoice?: 'w' | 'b' | 'random';
   clocks: {
     w: number;
     b: number;

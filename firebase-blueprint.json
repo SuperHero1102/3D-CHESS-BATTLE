@@ -216,6 +216,63 @@
         "reason",
         "createdAt"
       ]
+    },
+    "OnlineRoomConfig": {
+      "title": "OnlineRoomConfig",
+      "description": "Immutable host-configured online room metadata (side choice and per-turn timer).",
+      "type": "object",
+      "properties": {
+        "roomCode": {
+          "type": "string",
+          "minLength": 6,
+          "maxLength": 6,
+          "pattern": "^[A-Z0-9]{6}$"
+        },
+        "hostUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "hostSideChoice": {
+          "type": "string",
+          "enum": ["w", "b", "random"]
+        },
+        "hostColor": {
+          "type": "string",
+          "enum": ["w", "b"]
+        },
+        "guestColor": {
+          "type": "string",
+          "enum": ["w", "b"]
+        },
+        "turnMinutes": {
+          "type": "integer"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["waiting", "playing", "finished"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "roomCode",
+        "hostUid",
+        "hostSideChoice",
+        "hostColor",
+        "guestColor",
+        "turnMinutes",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -242,6 +299,12 @@
         "$ref": "#/entities/SafetyReport"
       },
       "description": "Write-only student safety reports."
+    },
+    "/rooms/{roomCode}": {
+      "schema": {
+        "$ref": "#/entities/OnlineRoomConfig"
+      },
+      "description": "Host-owned immutable online match room setup and status."
     }
   }
 }

@@ -3,15 +3,28 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { RotateCw, Pause, Play, X, Eye, Swords, Footprints, Sparkles } from 'lucide-react';
-import { PieceColor, PieceSymbol } from '../types/chess';
+import { Language, PieceColor, PieceSymbol } from '../types/chess';
+import { t } from '../i18n/translations';
+import { SETUP_V2 } from '../config/featureFlags';
 import { createMaterialPalette, MaterialPalette } from './materials';
 import {
   ArticulatedJointRig,
   createWarriorPiece,
+  disposeWarriorRig,
   PEDESTAL_HEIGHT,
   resetPose,
   WarriorRig,
 } from './warriorFactory';
+import {
+  GlbLoadProgressSnapshot,
+  getGlbBaseUrl,
+  getGlbLoadProgressSnapshot,
+  PIECE_CONFIG,
+  preloadGlbTemplates,
+  setGlbBaseUrl,
+  subscribeGlbProgress,
+  toGlbPieceKey,
+} from './modelLoader';
 
 type GalleryAnimMode = 'idle' | 'run' | 'attack';
 type GalleryAngle = 'front' | 'threeQuarter' | 'back';
@@ -20,10 +33,14 @@ interface GalleryDiagnostics {
   pieceName: string;
   factionLabel: string;
   modelVersionLabel: string;
+  isGlb: boolean;
   isV2: boolean;
   meshCount: number;
+  triangleCount: number;
   joints: string[];
   totalHeight: string;
+  normSizeText: string;
+  expectedFilename: string;
 }
 
 const PIECE_OPTIONS: { type: PieceSymbol; label: string; title: string }[] = [
@@ -44,12 +61,22 @@ const CAMERA_ANGLES: Record<GalleryAngle, { pos: [number, number, number]; targe
 function collectPieceDiagnostics(
   rig: WarriorRig,
   type: PieceSymbol,
-  side: PieceColor
+  side: PieceColor,
+  lang: Language
 ): GalleryDiagnostics {
   let meshCount = 0;
+  let triangleCount = 0;
   rig.root.traverse((obj) => {
-    if (obj instanceof THREE.Mesh && obj.visible && !obj.userData.isPieceHit) {
+    if (obj instanceof THREE.Mesh && obj.visible && !obj.userData.isPieceHit && !obj.userData.isInstanceHitbox) {
       meshCount += 1;
+      const geo = obj.geometry as THREE.BufferGeometry | undefined;
+      if (geo) {
+        if (geo.index) {
+          triangleCount += Math.round(geo.index.count / 3);
+        } else if (geo.attributes.position) {
+          triangleCount += Math.round(geo.attributes.position.count / 3);
+        }
+      }
     }
   });
 
@@ -104,37 +131,58 @@ function collectPieceDiagnostics(
   rig.root.updateMatrixWorld(true);
   const box = new THREE.Box3();
   rig.root.traverse((obj) => {
-    if (obj instanceof THREE.Mesh && obj.visible && !obj.userData.isPieceHit) {
+    if (obj instanceof THREE.Mesh && obj.visible && !obj.userData.isInstanceHitbox) {
       box.expandByObject(obj);
     }
   });
+  const size = new THREE.Vector3();
+  if (!box.isEmpty()) {
+    box.getSize(size);
+  }
   const height = box.isEmpty() ? 0 : box.max.y - box.min.y;
 
+  const glbCfg = PIECE_CONFIG[toGlbPieceKey(side, type)];
   const ver = rig.root.userData.modelVersion as string | undefined;
+  const isGlb = ver === 'glb';
   const isV2 = ver === 'v2';
-  const modelVersionLabel = isV2
-    ? 'MODEL v2'
-    : ver === 'glb'
-    ? 'MODEL GLB'
-    : 'MODEL v1 (cũ)';
+  const glbFilename = (rig.root.userData.glbFilename as string | undefined) || glbCfg.filename;
+  const glbTris = (rig.root.userData.glbTriangles as number | undefined) ?? triangleCount;
+  const glbNorm = rig.root.userData.glbNormSize as [number, number, number] | undefined;
+
+  const modelVersionLabel = isGlb
+    ? `MODEL: .glb (${glbFilename})`
+    : 'MODEL: cũ';
 
   const meta = PIECE_OPTIONS.find((p) => p.type === type)!;
   return {
     pieceName: meta.title,
-    factionLabel: side === 'w' ? 'Phe Ánh Sáng' : 'Phe Bóng Tối',
+    factionLabel: SETUP_V2
+      ? side === 'w'
+        ? t(lang, 'sideWhite')
+        : t(lang, 'sideBlack')
+      : side === 'w'
+        ? 'Phe Ánh Sáng'
+        : 'Phe Bóng Tối',
     modelVersionLabel,
+    isGlb,
     isV2,
     meshCount,
+    triangleCount: isGlb ? glbTris : triangleCount,
     joints,
     totalHeight: height.toFixed(2),
+    normSizeText: glbNorm
+      ? `${glbNorm[0]} × ${glbNorm[1]} × ${glbNorm[2]}`
+      : `${size.x.toFixed(2)} × ${size.y.toFixed(2)} × ${size.z.toFixed(2)}`,
+    expectedFilename: glbCfg.filename,
   };
 }
 
 export interface PieceGallery3DProps {
+  lang?: Language;
   onClose: () => void;
 }
 
-export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ onClose }) => {
+export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ lang = 'vi', onClose }) => {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const [pieceType, setPieceType] = useState<PieceSymbol>('k');
   const [side, setSide] = useState<PieceColor>('w');
@@ -143,15 +191,23 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ onClose }) => {
   const [anglePreset, setAnglePreset] = useState<GalleryAngle>('front');
   const [angleTrigger, setAngleTrigger] = useState<number>(0);
   const [diagnostics, setDiagnostics] = useState<GalleryDiagnostics | null>(null);
+  const [glbProgress, setGlbProgress] = useState<GlbLoadProgressSnapshot>(getGlbLoadProgressSnapshot);
+  const [glbUrlInput, setGlbUrlInput] = useState<string>(() => getGlbBaseUrl());
 
-  const stateRef = useRef({ animMode, turntable });
-  stateRef.current = { animMode, turntable };
+  const stateRef = useRef({ animMode, turntable, pieceType, side, lang });
+  stateRef.current = { animMode, turntable, pieceType, side, lang };
 
   const galleryApiRef = useRef<{
     loadPiece: (type: PieceSymbol, color: PieceColor) => void;
     setCameraAngle: (angle: GalleryAngle) => void;
     triggerAttackPulse: () => void;
   } | null>(null);
+
+  useEffect(() => {
+    const unsub = subscribeGlbProgress(setGlbProgress);
+    void preloadGlbTemplates();
+    return unsub;
+  }, []);
 
   useEffect(() => {
     const container = mountRef.current;
@@ -308,8 +364,10 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ onClose }) => {
 
     const loadPiece = (type: PieceSymbol, color: PieceColor) => {
       if (currentRig) {
+        disposeWarriorRig(currentRig);
         turntableGroup.remove(currentRig.root);
       }
+      turntableGroup.clear();
       currentType = type;
       currentSide = color;
       const rig = createWarriorPiece(palette, color, type, !isSoftwareGl);
@@ -318,10 +376,15 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ onClose }) => {
       turntableGroup.add(rig.root);
       currentRig = rig;
       attackElapsed = 0;
-      setDiagnostics(collectPieceDiagnostics(rig, type, color));
+      setDiagnostics(collectPieceDiagnostics(rig, type, color, stateRef.current.lang));
     };
 
     loadPiece(pieceType, side);
+
+    const onGlbUpdated = () => {
+      loadPiece(stateRef.current.pieceType, stateRef.current.side);
+    };
+    window.addEventListener('glb-models-updated', onGlbUpdated);
 
     galleryApiRef.current = {
       loadPiece,
@@ -352,9 +415,31 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ onClose }) => {
       renderer.compile(scene, camera);
     }
 
-    const clock = new THREE.Clock();
+    let lastTickMs = performance.now();
+    let elapsedSec = 0;
     let frameId = 0;
     let disposed = false;
+
+    const scheduleNext = () => {
+      if (disposed || document.hidden) return;
+      if (isSoftwareGl) {
+        afterDraw(tick);
+      } else {
+        frameId = requestAnimationFrame(tick);
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (disposed) return;
+      if (document.hidden) {
+        cancelAnimationFrame(frameId);
+        clearTimeout(frameId);
+      } else {
+        lastTickMs = performance.now();
+        scheduleNext();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     function afterDraw(cb: () => void) {
       const gl = renderer.getContext() as WebGL2RenderingContext;
@@ -365,7 +450,7 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ onClose }) => {
         return;
       }
       const poll = () => {
-        if (disposed) return;
+        if (disposed || document.hidden) return;
         const st = gl.getSyncParameter(sync, gl.SYNC_STATUS);
         if (st === gl.UNSIGNALED) {
           frameId = window.setTimeout(poll, 5);
@@ -378,9 +463,13 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ onClose }) => {
     }
 
     function tick() {
-      if (disposed) return;
-      const dt = Math.min(clock.getDelta(), 0.05);
-      const elapsed = clock.getElapsedTime();
+      if (disposed || document.hidden) return;
+      const nowMs = performance.now();
+      const rawDt = Math.max(0, (nowMs - lastTickMs) / 1000);
+      lastTickMs = nowMs;
+      const dt = Math.min(rawDt, 0.05);
+      elapsedSec += dt;
+      const elapsed = elapsedSec;
 
       if (stateRef.current.turntable && !desiredCamPos) {
         turntableGroup.rotation.y += dt * 0.42;
@@ -502,12 +591,7 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ onClose }) => {
 
       controls.update();
       renderer.render(scene, camera);
-
-      if (isSoftwareGl) {
-        afterDraw(tick);
-      } else {
-        frameId = requestAnimationFrame(tick);
-      }
+      scheduleNext();
     }
 
     tick();
@@ -516,9 +600,14 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ onClose }) => {
       disposed = true;
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('resize', onResize);
+      window.removeEventListener('glb-models-updated', onGlbUpdated);
       controls.removeEventListener('start', cancelCamAnim);
       controls.dispose();
+      if (currentRig) {
+        disposeWarriorRig(currentRig);
+      }
       palette.dispose();
       envTex.dispose();
       floorMat.dispose();
@@ -548,38 +637,88 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ onClose }) => {
 
       {/* Permanent Top-Left Diagnostic Badge */}
       {diagnostics && (
-        <div className="fixed top-4 left-4 z-20 max-w-xs rounded-xl bg-[#111622]/92 border border-[#D4AF37]/45 px-4 py-3 shadow-2xl space-y-2 pointer-events-auto">
+        <div className="fixed top-4 left-4 z-20 max-w-sm rounded-xl bg-[#111622]/92 border border-[#D4AF37]/45 px-4 py-3 shadow-2xl space-y-2 pointer-events-auto">
           <div className="flex items-center justify-between gap-2">
             <span className="font-display text-sm font-bold text-[#FFD700] tracking-wide">
               {diagnostics.pieceName}
             </span>
             <span
               className={`px-2 py-0.5 rounded text-[11px] font-mono-tabular font-bold shrink-0 border ${
-                diagnostics.isV2
+                diagnostics.isGlb
                   ? 'bg-emerald-500/20 text-emerald-300 border-emerald-400/50'
-                  : 'bg-amber-500/20 text-amber-300 border-amber-400/50'
+                  : 'bg-rose-500/20 text-rose-200 border-rose-400/50'
               }`}
             >
               {diagnostics.modelVersionLabel}
             </span>
           </div>
 
-          <div className="flex items-center gap-3 text-xs text-[#CBD5E1] font-mono-tabular">
+          <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-[#CBD5E1] font-mono-tabular">
             <span>{diagnostics.factionLabel}</span>
             <span>•</span>
-            <span>Số mesh: {diagnostics.meshCount}</span>
+            <span>Tam giác: {diagnostics.triangleCount.toLocaleString()}</span>
             <span>•</span>
-            <span>Cao: {diagnostics.totalHeight}</span>
+            <span>Mesh: {diagnostics.meshCount}</span>
           </div>
 
-          <div className="pt-1 border-t border-white/10">
-            <div className="text-[10px] uppercase tracking-wider text-[#9AA3B2] mb-1">
-              Danh sách khớp ({diagnostics.joints.length})
-            </div>
-            <div className="text-[11px] font-mono-tabular text-[#E2E8F0] leading-relaxed max-h-24 overflow-y-auto custom-scrollbar">
-              {diagnostics.joints.join(' → ')}
-            </div>
+          <div className="text-[11px] font-mono-tabular text-[#9AA3B2]">
+            Kích thước chuẩn hóa (R×C×S): <span className="text-[#F3EFE6]">{diagnostics.normSizeText}</span>
           </div>
+
+          {glbProgress.enabled && glbProgress.loading && (
+            <div className="pt-1 border-t border-white/10 space-y-1">
+              <div className="flex justify-between text-[11px] text-[#FFD700]">
+                <span>Đang nạp mô hình quân cờ…</span>
+                <span className="font-mono-tabular">
+                  {glbProgress.percent}% ({glbProgress.loadedCount}/{glbProgress.totalCount})
+                </span>
+              </div>
+              <div className="h-1.5 w-full rounded-full bg-white/10 overflow-hidden">
+                <div className="h-full bg-[#FFD700]" style={{ width: `${glbProgress.percent}%` }} />
+              </div>
+            </div>
+          )}
+
+          {glbProgress.enabled && !glbProgress.loading && !diagnostics.isGlb && (
+            <div className="pt-1.5 border-t border-red-500/30 space-y-1.5">
+              <div className="text-[11px] font-semibold text-red-300">
+                Thiếu mô hình: {diagnostics.expectedFilename}
+              </div>
+              <form
+                className="flex items-center gap-1.5"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  setGlbBaseUrl(glbUrlInput);
+                  void preloadGlbTemplates(true);
+                }}
+              >
+                <input
+                  type="url"
+                  value={glbUrlInput}
+                  onChange={(e) => setGlbUrlInput(e.target.value)}
+                  placeholder="URL GitHub/CDN chứa 12 .glb..."
+                  className="flex-1 rounded bg-black/40 border border-red-400/40 px-2 py-1 text-[11px] text-white placeholder:text-red-200/40"
+                />
+                <button
+                  type="submit"
+                  className="px-2 py-1 rounded bg-[#D4AF37] text-[#0D1017] font-bold text-[11px] shrink-0"
+                >
+                  Tải
+                </button>
+              </form>
+            </div>
+          )}
+
+          {!diagnostics.isGlb && diagnostics.joints.length > 0 && (
+            <div className="pt-1 border-t border-white/10">
+              <div className="text-[10px] uppercase tracking-wider text-[#9AA3B2] mb-1">
+                Danh sách khớp ({diagnostics.joints.length})
+              </div>
+              <div className="text-[11px] font-mono-tabular text-[#E2E8F0] leading-relaxed max-h-20 overflow-y-auto custom-scrollbar">
+                {diagnostics.joints.join(' → ')}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -621,11 +760,11 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ onClose }) => {
               onClick={() => setSide('w')}
               className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold border ${
                 side === 'w'
-                  ? 'bg-amber-500/20 border-amber-400 text-amber-200'
+                  ? 'bg-red-500/20 border-red-400 text-red-200'
                   : 'bg-[#181E2B] border-white/10 text-[#9AA3B2]'
               }`}
             >
-              Phe Sáng
+              {SETUP_V2 ? t(lang, 'sideWhite') : 'Phe Sáng'}
             </button>
             <button
               type="button"
@@ -636,7 +775,7 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ onClose }) => {
                   : 'bg-[#181E2B] border-white/10 text-[#9AA3B2]'
               }`}
             >
-              Phe Tối
+              {SETUP_V2 ? t(lang, 'sideBlack') : 'Phe Tối'}
             </button>
           </div>
         </div>

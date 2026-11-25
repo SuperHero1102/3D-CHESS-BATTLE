@@ -2,8 +2,9 @@ import * as THREE from 'three';
 import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
 import { PieceColor, PieceSymbol } from '../types/chess';
 import { MaterialPalette, getKingdomMaterials } from './materials';
-import { CachedGlbTemplate, MODEL_CONFIG, getLoadedGlbTemplate } from './modelLoader';
+import { CachedGlbTemplate, PIECE_CONFIG, USE_GLB_PIECES, getLoadedGlbTemplate, toGlbPieceKey } from './modelLoader';
 import { buildKingV2 } from './kingBuilderV2';
+import { UX_POLISH } from '../config/featureFlags';
 
 export const PEDESTAL_HEIGHT = 0.088;
 
@@ -114,6 +115,8 @@ export interface WarriorRig {
   headHeight: number;
   selectableMeshes: THREE.Mesh[];
   isGlb?: boolean;
+  alignGroup?: THREE.Group;
+  glbNormSize?: [number, number, number];
   mixer?: THREE.AnimationMixer;
 }
 
@@ -229,6 +232,11 @@ function addPedestalWithEmblems(
   pedMesh.castShadow = true;
   pedMesh.receiveShadow = true;
   pedMesh.name = 'pedestal_stone';
+  if (UX_POLISH) {
+    pedMesh.layers.enable(1);
+    pedMesh.userData.isPieceHit = true;
+    pedMesh.userData.pieceRoot = root;
+  }
   root.add(pedMesh);
   selectableMeshes.push(pedMesh);
 
@@ -236,6 +244,11 @@ function addPedestalWithEmblems(
   baseRim.rotation.x = Math.PI / 2;
   baseRim.position.y = 0.014;
   baseRim.name = 'pedestal_rim';
+  if (UX_POLISH) {
+    baseRim.layers.enable(1);
+    baseRim.userData.isPieceHit = true;
+    baseRim.userData.pieceRoot = root;
+  }
   root.add(baseRim);
   selectableMeshes.push(baseRim);
 
@@ -268,13 +281,16 @@ function addPedestalWithEmblems(
 
   root.add(frontMed, backMed);
 
-  // Invisible generous click hitbox cylinder on layer 1 for effortless selection
-  const hitGeo = new THREE.CylinderGeometry(0.41, 0.41, 1.25, 12);
+  // Invisible click hitbox cylinder on layer 1 sized to piece height so front-row pieces don't occlude squares behind them
+  const pieceCfg = PIECE_CONFIG[toGlbPieceKey(color, type)];
+  const hitH = Math.max(1.05, Math.min(1.8, PEDESTAL_HEIGHT + (pieceCfg?.targetHeight ?? 1.35)));
+  const hitGeo = new THREE.CylinderGeometry(0.36, 0.38, hitH, 12);
   const hitMat = new THREE.MeshBasicMaterial({ visible: false });
   const hitMesh = new THREE.Mesh(hitGeo, hitMat);
-  hitMesh.position.y = 0.62;
+  hitMesh.position.y = hitH * 0.5;
   hitMesh.layers.enable(1);
   hitMesh.userData.isPieceHit = true;
+  hitMesh.userData.isInstanceHitbox = true;
   hitMesh.userData.pieceRoot = root;
   root.add(hitMesh);
 }
@@ -1463,7 +1479,7 @@ function buildArticulatedKnight(
 }
 
 // ============================================================================
-// OPTIONAL USER-UPLOADED GLB WRAPPER (PRESERVED COMPATIBILITY)
+// 12-FACTION .GLB PIECE BUILDER (Normalized Box3, shared geo/textures, clone mat on highlight)
 // ============================================================================
 
 function buildGlbPiece(
@@ -1472,23 +1488,34 @@ function buildGlbPiece(
   type: PieceSymbol,
   template: CachedGlbTemplate
 ): WarriorRig {
-  const cfg = MODEL_CONFIG[type];
+  const cfg = PIECE_CONFIG[toGlbPieceKey(color, type)];
   const root = new THREE.Group();
   root.userData.color = color;
   root.userData.type = type;
   root.userData.modelVersion = 'glb';
+  root.userData.glbFilename = template.filename;
+  root.userData.glbTriangles = template.triangleCount;
 
   const selectableMeshes: THREE.Mesh[] = [];
   addPedestalWithEmblems(root, palette, color, type, selectableMeshes);
 
   const bodyGroup = new THREE.Group();
   bodyGroup.position.y = PEDESTAL_HEIGHT;
+  bodyGroup.rotation.order = 'YXZ';
+  // Phe Sáng (rank 1, +Z) quay mặt về Phe Tối (-Z); Phe Tối quay về +Z
   bodyGroup.rotation.y = color === 'w' ? Math.PI : 0;
   root.add(bodyGroup);
 
+  const alignGroup = new THREE.Group();
+  alignGroup.rotation.order = 'YXZ';
+  alignGroup.rotation.y = cfg.rotationY;
+  alignGroup.position.y = cfg.offsetY;
+  bodyGroup.add(alignGroup);
+
   const modelClone = SkeletonUtils.clone(template.gltf.scene);
-  const rawMax = Math.max(template.rawSize.x, template.rawSize.y, template.rawSize.z, 0.001);
-  const normScale = (1.0 / rawMax) * cfg.scale;
+  const safeY = Math.max(template.rawSize.y, 0.001);
+  const safeHoriz = Math.max(template.rawSize.x, template.rawSize.z, 0.001);
+  const normScale = Math.min(cfg.targetHeight / safeY, cfg.maxFootprint / safeHoriz) * cfg.scale;
   modelClone.scale.setScalar(normScale);
   modelClone.position.set(
     -template.rawCenter.x * normScale,
@@ -1496,14 +1523,28 @@ function buildGlbPiece(
     -template.rawCenter.z * normScale
   );
 
+  const normW = +(template.rawSize.x * normScale).toFixed(2);
+  const normH = +(template.rawSize.y * normScale).toFixed(2);
+  const normD = +(template.rawSize.z * normScale).toFixed(2);
+  root.userData.glbNormSize = [normW, normH, normD];
+
   modelClone.traverse((obj) => {
     if (obj instanceof THREE.Mesh) {
+      if (obj.userData.isHiddenGlbBase && cfg.hideBase) {
+        obj.visible = false;
+        return;
+      }
       obj.castShadow = true;
       obj.receiveShadow = true;
-      selectableMeshes.push(obj);
+      obj.userData.isPieceHit = true;
+      obj.userData.pieceRoot = root;
+      obj.userData.sharedBaseMaterial = obj.material;
+      if (obj.visible) {
+        selectableMeshes.push(obj);
+      }
     }
   });
-  bodyGroup.add(modelClone);
+  alignGroup.add(modelClone);
 
   let mixer: THREE.AnimationMixer | undefined;
   if (template.gltf.animations.length > 0) {
@@ -1516,7 +1557,9 @@ function buildGlbPiece(
   bodyGroup.add(dummyGroup);
   const neutralPose = () => {
     bodyGroup.position.set(0, PEDESTAL_HEIGHT, 0);
-    bodyGroup.rotation.set(0, color === 'w' ? Math.PI : 0, 0);
+    bodyGroup.rotation.set(0, color === 'w' ? Math.PI : 0, 0, 'YXZ');
+    alignGroup.rotation.set(0, cfg.rotationY, 0, 'YXZ');
+    alignGroup.position.set(0, cfg.offsetY, 0);
   };
   root.userData.rig = {
     root,
@@ -1535,7 +1578,7 @@ function buildGlbPiece(
     neutralPose,
   } satisfies ArticulatedJointRig;
 
-  return {
+  const rig: WarriorRig = {
     root,
     bodyGroup,
     pelvis: dummyGroup,
@@ -1547,11 +1590,177 @@ function buildGlbPiece(
     rightForearmPivot: dummyGroup,
     leftLegPivot: dummyGroup,
     rightLegPivot: dummyGroup,
-    headHeight: PEDESTAL_HEIGHT + template.rawSize.y * normScale,
+    headHeight: PEDESTAL_HEIGHT + normH,
     selectableMeshes,
     isGlb: true,
+    alignGroup,
+    glbNormSize: [normW, normH, normD],
     mixer,
   };
+  root.userData.warriorRig = rig;
+  return rig;
+}
+
+/**
+ * MỤC 5: Dự phòng tối giản sạch khi USE_GLB_PIECES=true mà thiếu/lỗi file .glb
+ * (Tuyệt đối không dựng lại chiến binh procedural cũ).
+ */
+function buildMinimalGlbFallbackPiece(
+  palette: MaterialPalette,
+  color: PieceColor,
+  type: PieceSymbol
+): WarriorRig {
+  const cfg = PIECE_CONFIG[toGlbPieceKey(color, type)];
+  const root = new THREE.Group();
+  root.userData.color = color;
+  root.userData.type = type;
+  root.userData.modelVersion = 'missing_glb_fallback';
+  root.userData.isMissingFallback = true;
+  root.userData.glbFilename = cfg.filename;
+
+  const selectableMeshes: THREE.Mesh[] = [];
+  addPedestalWithEmblems(root, palette, color, type, selectableMeshes);
+
+  const bodyGroup = new THREE.Group();
+  bodyGroup.position.y = PEDESTAL_HEIGHT;
+  bodyGroup.rotation.order = 'YXZ';
+  bodyGroup.rotation.y = color === 'w' ? Math.PI : 0;
+  root.add(bodyGroup);
+
+  const alignGroup = new THREE.Group();
+  alignGroup.rotation.order = 'YXZ';
+  bodyGroup.add(alignGroup);
+
+  const totH = Math.max(0.55, cfg.targetHeight * 0.65);
+  const spireGeo = new THREE.OctahedronGeometry(0.18, 0);
+  spireGeo.scale(0.9, totH / 0.36, 0.9);
+  const spireMat = new THREE.MeshStandardMaterial({
+    color: color === 'w' ? 0xd9b86c : 0x4b3f66,
+    emissive: color === 'w' ? 0x5c4110 : 0x24133a,
+    emissiveIntensity: 0.4,
+    roughness: 0.4,
+    metalness: 0.6,
+  });
+  const spireMesh = new THREE.Mesh(spireGeo, spireMat);
+  spireMesh.position.y = totH * 0.52;
+  spireMesh.castShadow = true;
+  spireMesh.receiveShadow = true;
+  spireMesh.userData.isPieceHit = true;
+  spireMesh.userData.pieceRoot = root;
+  spireMesh.userData.isOwnedFallback = true;
+  spireMesh.userData.sharedBaseMaterial = spireMat;
+  alignGroup.add(spireMesh);
+  selectableMeshes.push(spireMesh);
+
+  const dummyGroup = new THREE.Group();
+  bodyGroup.add(dummyGroup);
+
+  const neutralPose = () => {
+    bodyGroup.position.set(0, PEDESTAL_HEIGHT, 0);
+    bodyGroup.rotation.set(0, color === 'w' ? Math.PI : 0, 0, 'YXZ');
+    alignGroup.rotation.set(0, 0, 0, 'YXZ');
+    alignGroup.position.set(0, 0, 0);
+  };
+
+  root.userData.rig = {
+    root,
+    bodyGroup,
+    pelvis: dummyGroup,
+    torso: dummyGroup,
+    head: dummyGroup,
+    armL: dummyGroup,
+    armR: dummyGroup,
+    forearmL: dummyGroup,
+    forearmR: dummyGroup,
+    legL: dummyGroup,
+    legR: dummyGroup,
+    capeSegs: [],
+    selectableMeshes,
+    neutralPose,
+  } satisfies ArticulatedJointRig;
+
+  const normSize: [number, number, number] = [0.36, +totH.toFixed(2), 0.36];
+  const rig: WarriorRig = {
+    root,
+    bodyGroup,
+    pelvis: dummyGroup,
+    torso: dummyGroup,
+    headPivot: dummyGroup,
+    leftArmPivot: dummyGroup,
+    rightArmPivot: dummyGroup,
+    leftForearmPivot: dummyGroup,
+    rightForearmPivot: dummyGroup,
+    leftLegPivot: dummyGroup,
+    rightLegPivot: dummyGroup,
+    headHeight: PEDESTAL_HEIGHT + totH,
+    selectableMeshes,
+    isGlb: false,
+    alignGroup,
+    glbNormSize: normSize,
+  };
+  root.userData.warriorRig = rig;
+  return rig;
+}
+
+// ============================================================================
+// PER-PIECE HIGHLIGHT EMISSIVE & CAPTURE MATERIAL CLEANUP
+// ============================================================================
+
+export function setWarriorHighlightState(rig: WarriorRig, state: 'none' | 'hover' | 'select') {
+  const prevState = (rig.root.userData.highlightState as 'none' | 'hover' | 'select' | undefined) ?? 'none';
+  if (prevState === state) return;
+  rig.root.userData.highlightState = state;
+
+  const applyToMat = (mat: THREE.Material, mode: 'hover' | 'select'): THREE.Material => {
+    const cloned = mat.clone();
+    if (cloned instanceof THREE.MeshStandardMaterial || cloned instanceof THREE.MeshPhysicalMaterial) {
+      cloned.emissive.setHex(mode === 'select' ? 0xd4af37 : 0x3b82f6);
+      cloned.emissiveIntensity = mode === 'select' ? 0.38 : 0.25;
+      cloned.needsUpdate = true;
+    }
+    return cloned;
+  };
+
+  for (const mesh of rig.selectableMeshes) {
+    if (mesh.name === 'pedestal_stone' || mesh.name === 'pedestal_rim') continue;
+    const prevCloned = mesh.userData.highlightClonedMat as THREE.Material | THREE.Material[] | undefined;
+    if (prevCloned) {
+      if (Array.isArray(prevCloned)) prevCloned.forEach((m) => m.dispose());
+      else prevCloned.dispose();
+      delete mesh.userData.highlightClonedMat;
+    }
+
+    if (state === 'none') {
+      if (mesh.userData.sharedBaseMaterial) {
+        mesh.material = mesh.userData.sharedBaseMaterial as THREE.Material | THREE.Material[];
+      }
+      continue;
+    }
+
+    if (!mesh.userData.sharedBaseMaterial) {
+      mesh.userData.sharedBaseMaterial = mesh.material;
+    }
+    const base = mesh.userData.sharedBaseMaterial as THREE.Material | THREE.Material[];
+    const cloned = Array.isArray(base) ? base.map((m) => applyToMat(m, state)) : applyToMat(base, state);
+    mesh.userData.highlightClonedMat = cloned;
+    mesh.material = cloned;
+  }
+}
+
+export function disposeWarriorRig(rig: WarriorRig) {
+  setWarriorHighlightState(rig, 'none');
+  if (rig.mixer) {
+    rig.mixer.stopAllAction();
+    rig.mixer.uncacheRoot(rig.root);
+  }
+  rig.root.traverse((obj) => {
+    if (!(obj instanceof THREE.Mesh)) return;
+    if (obj.userData.isInstanceHitbox || obj.userData.isOwnedFallback) {
+      obj.geometry.dispose();
+      if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
+      else obj.material.dispose();
+    }
+  });
 }
 
 // ============================================================================
@@ -1574,6 +1783,13 @@ export function buildPiece(
   enablePointLights = true
 ): THREE.Group {
   const type = normalizePieceSymbol(typeInput);
+  const glbTemplate = getLoadedGlbTemplate(side, type);
+  if (glbTemplate) {
+    return buildGlbPiece(palette, side, type, glbTemplate).root;
+  }
+  if (USE_GLB_PIECES) {
+    return buildMinimalGlbFallbackPiece(palette, side, type).root;
+  }
   if (type === 'k') {
     const kingRig = buildKingV2(palette, side, addPedestalWithEmblems);
     return kingRig.root;
@@ -1599,9 +1815,12 @@ export function createWarriorPiece(
   type: PieceSymbol,
   enablePointLights = true
 ): WarriorRig {
-  const glbTemplate = getLoadedGlbTemplate(type);
+  const glbTemplate = getLoadedGlbTemplate(color, type);
   if (glbTemplate) {
     return buildGlbPiece(palette, color, type, glbTemplate);
+  }
+  if (USE_GLB_PIECES) {
+    return buildMinimalGlbFallbackPiece(palette, color, type);
   }
 
   const group = buildPiece(type, color, palette, enablePointLights);

@@ -20,10 +20,10 @@ import {
   Ban,
   Home,
   X,
+  WifiOff,
 } from 'lucide-react';
 import {
   CameraPreset,
-  CombatPace,
   GameMode,
   GameOverInfo,
   GameSettings,
@@ -33,6 +33,7 @@ import {
   SafeChatMessage,
 } from '../types/chess';
 import { PRESET_CHAT_KEYS, PresetChatKey, t } from '../i18n/translations';
+import { SETUP_V2, UX_POLISH } from '../config/featureFlags';
 
 interface GameHUDProps {
   mode: Exclude<GameMode, 'menu' | 'learn'>;
@@ -52,6 +53,7 @@ interface GameHUDProps {
   gameOver: GameOverInfo | null;
   paused: boolean;
   promotionPending: boolean;
+  serverReconnecting?: boolean;
   onlineStatus?: {
     roomCode: string;
     myColor: PieceColor;
@@ -116,6 +118,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
   gameOver,
   paused,
   promotionPending,
+  serverReconnecting,
   onlineStatus,
   onCameraPreset,
   onResetCamera,
@@ -144,43 +147,94 @@ export const GameHUD: React.FC<GameHUDProps> = ({
 
   const visibleChat = onlineStatus?.muted ? [] : onlineStatus?.chat || [];
 
+  const topInsetClass = UX_POLISH
+    ? 'top-[max(0.5rem,env(safe-area-inset-top))] left-[max(0.5rem,env(safe-area-inset-left))] right-[max(0.5rem,env(safe-area-inset-right))] sm:top-3 sm:left-3 sm:right-3'
+    : 'top-3 left-3 right-3';
+
+  const bottomInsetClass = UX_POLISH
+    ? 'bottom-[max(0.75rem,env(safe-area-inset-bottom))]'
+    : 'bottom-4';
+
+  const renderClockPill = (ms: number, isActiveTurn: boolean, isDark: boolean) => {
+    if (untimed) {
+      if (!SETUP_V2) return null;
+      return (
+        <div
+          title={t(lang, 'untimed')}
+          className={`text-[10px] sm:text-xs font-semibold px-2 py-1 rounded-lg shrink-0 whitespace-nowrap border ${
+            isActiveTurn && !gameOver
+              ? isDark
+                ? 'bg-[#7C3AED]/25 border-[#A855F7]/60 text-[#E9D5FF]'
+                : 'bg-[#D4AF37]/20 border-[#D4AF37]/70 text-[#FDE68A]'
+              : 'bg-[#181E2B] border-white/10 text-[#9AA3B2]'
+          }`}
+        >
+          <span className="hidden xs:inline sm:inline">{t(lang, 'untimed')}</span>
+          <span className="sm:hidden">{t(lang, 'untimed')}</span>
+        </div>
+      );
+    }
+
+    return (
+      <div
+        className={`font-mono-tabular text-xs sm:text-base font-bold px-2 sm:px-2.5 py-1 rounded-lg shrink-0 ${
+          isActiveTurn
+            ? isDark
+              ? 'bg-[#7C3AED] text-white'
+              : 'bg-[#D4AF37] text-[#0D1017]'
+            : 'bg-[#181E2B] text-[#9AA3B2]'
+        }`}
+      >
+        {formatClock(ms)}
+      </div>
+    );
+  };
+
   return (
     <>
-      {/* Top Player Strips (Compact, non-occluding) */}
-      <div className="fixed top-3 left-3 right-3 z-20 pointer-events-none flex flex-col items-center gap-2">
-        <div className="pointer-events-auto w-full max-w-5xl flex items-stretch justify-between gap-2 sm:gap-4">
-          {/* White Kingdom Card */}
+      {/* Top Player Strips (Compact, non-occluding, safe-area aware) */}
+      <div className={`fixed ${topInsetClass} z-20 pointer-events-none flex flex-col items-center gap-2`}>
+        <div className="pointer-events-auto w-full max-w-5xl flex items-stretch justify-between gap-1.5 sm:gap-4">
+          {/* Light / Red Army Card */}
           <div
-            className={`flex-1 min-w-0 rounded-xl px-3 py-2 border transition-colors bg-[#121620]/92 flex items-center justify-between gap-2 ${
-              turn === 'w' && !gameOver ? 'border-[#D4AF37]' : 'border-white/12'
+            className={`flex-1 min-w-0 rounded-xl px-2.5 sm:px-3 py-2 border transition-colors bg-[#121620]/92 flex items-center justify-between gap-1.5 sm:gap-2 ${
+              turn === 'w' && !gameOver
+                ? SETUP_V2
+                  ? 'border-[#EF4444]'
+                  : 'border-[#D4AF37]'
+                : 'border-white/12'
             }`}
           >
-            <div className="min-w-0">
-              <div className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-sm bg-[#E5E7EB] shrink-0" />
-                <span className="text-xs sm:text-sm font-bold text-[#F3EFE6] truncate">{whiteName}</span>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1.5 min-w-0">
+                <span
+                  className={`w-2.5 h-2.5 rounded-sm shrink-0 ${
+                    SETUP_V2 ? 'bg-[#EF4444] ring-1 ring-[#FDE68A]/70' : 'bg-[#E5E7EB]'
+                  }`}
+                />
+                <span
+                  className={`text-[11px] sm:text-sm font-bold text-[#F3EFE6] leading-tight ${
+                    UX_POLISH ? 'line-clamp-2 break-words' : 'truncate'
+                  }`}
+                >
+                  {whiteName}
+                </span>
               </div>
-              <div className="text-[11px] text-[#9AA3B2] truncate h-4">
-                {capturedByWhite.map((p, idx) => (
-                  <span key={`${p}-${idx}`} className="mr-0.5 text-[#D4AF37]">
-                    {PIECE_UNICODE[p]}
-                  </span>
-                ))}
-              </div>
+              {capturedByWhite.length > 0 && (
+                <div className="text-[11px] text-[#9AA3B2] truncate h-4 mt-0.5">
+                  {capturedByWhite.map((p, idx) => (
+                    <span key={`${p}-${idx}`} className="mr-0.5 text-[#D4AF37]">
+                      {PIECE_UNICODE[p]}
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
-            {!untimed && (
-              <div
-                className={`font-mono-tabular text-sm sm:text-base font-bold px-2.5 py-1 rounded-lg shrink-0 ${
-                  turn === 'w' ? 'bg-[#D4AF37] text-[#0D1017]' : 'bg-[#181E2B] text-[#9AA3B2]'
-                }`}
-              >
-                {formatClock(whiteClockMs)}
-              </div>
-            )}
+            {renderClockPill(whiteClockMs, turn === 'w', false)}
           </div>
 
           {/* Center Turn / Room Status */}
-          <div className="hidden md:flex flex-col items-center justify-center px-4 py-1.5 rounded-xl bg-[#121620]/92 border border-white/12 shrink-0 min-w-[170px]">
+          <div className="hidden md:flex flex-col items-center justify-center px-4 py-1.5 rounded-xl bg-[#121620]/92 border border-white/12 shrink-0 min-w-[180px]">
             <span className="text-xs font-semibold text-[#F3EFE6]">
               {turn === 'w' ? t(lang, 'turnWhite') : t(lang, 'turnBlack')}
             </span>
@@ -191,39 +245,45 @@ export const GameHUD: React.FC<GameHUDProps> = ({
             )}
           </div>
 
-          {/* Black Kingdom Card */}
+          {/* Night / Purple Army Card */}
           <div
-            className={`flex-1 min-w-0 rounded-xl px-3 py-2 border transition-colors bg-[#121620]/92 flex items-center justify-between gap-2 ${
+            className={`flex-1 min-w-0 rounded-xl px-2.5 sm:px-3 py-2 border transition-colors bg-[#121620]/92 flex items-center justify-between gap-1.5 sm:gap-2 ${
               turn === 'b' && !gameOver ? 'border-[#A855F7]' : 'border-white/12'
             }`}
           >
-            {!untimed && (
-              <div
-                className={`font-mono-tabular text-sm sm:text-base font-bold px-2.5 py-1 rounded-lg shrink-0 ${
-                  turn === 'b' ? 'bg-[#7C3AED] text-white' : 'bg-[#181E2B] text-[#9AA3B2]'
-                }`}
-              >
-                {formatClock(blackClockMs)}
+            {renderClockPill(blackClockMs, turn === 'b', true)}
+            <div className="min-w-0 flex-1 text-right ml-auto">
+              <div className="flex items-center justify-end gap-1.5 min-w-0">
+                <span
+                  className={`text-[11px] sm:text-sm font-bold text-[#F3EFE6] leading-tight ${
+                    UX_POLISH ? 'line-clamp-2 break-words' : 'truncate'
+                  }`}
+                >
+                  {blackName}
+                </span>
+                <span className="w-2.5 h-2.5 rounded-sm bg-[#7C3AED] ring-1 ring-[#D8B4FE]/60 shrink-0" />
               </div>
-            )}
-            <div className="min-w-0 text-right ml-auto">
-              <div className="flex items-center justify-end gap-1.5">
-                <span className="text-xs sm:text-sm font-bold text-[#F3EFE6] truncate">{blackName}</span>
-                <span className="w-2.5 h-2.5 rounded-sm bg-[#7C3AED] shrink-0" />
-              </div>
-              <div className="text-[11px] text-[#9AA3B2] truncate h-4">
-                {capturedByBlack.map((p, idx) => (
-                  <span key={`${p}-${idx}`} className="ml-0.5 text-[#E5E7EB]">
-                    {PIECE_UNICODE[p]}
-                  </span>
-                ))}
-              </div>
+              {capturedByBlack.length > 0 && (
+                <div className="text-[11px] text-[#9AA3B2] truncate h-4 mt-0.5">
+                  {capturedByBlack.map((p, idx) => (
+                    <span key={`${p}-${idx}`} className="ml-0.5 text-[#E5E7EB]">
+                      {PIECE_UNICODE[p]}
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         </div>
 
-        {/* Status Banners (Check, AI Thinking, Combat Skip, Online Draw/Disconnect) */}
+        {/* Status Banners (Check, AI Thinking, Combat Skip, Online Draw/Disconnect/Reconnect) */}
         <div className="flex flex-wrap items-center justify-center gap-2 pointer-events-auto">
+          {UX_POLISH && serverReconnecting && mode === 'online' && !gameOver && (
+            <div className="px-3.5 py-1.5 rounded-lg bg-amber-950/95 border border-amber-400/50 text-xs font-semibold text-amber-100 flex items-center gap-1.5 shadow-lg">
+              <WifiOff className="w-3.5 h-3.5 text-amber-300" />
+              <span>{t(lang, 'reconnecting')}</span>
+            </div>
+          )}
           {inCheck && !gameOver && (
             <div className="px-4 py-1.5 rounded-lg bg-rose-700 text-white text-xs font-bold tracking-wider shadow-lg">
               {t(lang, 'inCheck')}
@@ -236,11 +296,14 @@ export const GameHUD: React.FC<GameHUDProps> = ({
           )}
           {combatActive && (
             <button
+              type="button"
               onClick={onSkipCombat}
               className="px-4 py-1.5 rounded-lg bg-[#D4AF37] text-[#0D1017] text-xs font-bold flex items-center gap-1.5 shadow-lg"
             >
               <FastForward className="w-3.5 h-3.5" />
-              <span>{t(lang, 'combatInProgress')} · {t(lang, 'skipCombat')}</span>
+              <span>
+                {t(lang, 'combatInProgress')} · {t(lang, 'skipCombat')}
+              </span>
             </button>
           )}
           {onlineStatus && !onlineStatus.opponentConnected && !gameOver && (
@@ -252,12 +315,14 @@ export const GameHUD: React.FC<GameHUDProps> = ({
             <div className="px-4 py-2 rounded-xl bg-[#161B26] border border-[#D4AF37]/50 flex items-center gap-3 shadow-xl">
               <span className="text-xs font-semibold text-[#F3EFE6]">{t(lang, 'opponentOfferedDraw')}</span>
               <button
+                type="button"
                 onClick={() => onRespondDraw?.(true)}
                 className="px-3 py-1 rounded-lg bg-emerald-600 text-white text-xs font-bold"
               >
                 {t(lang, 'acceptDraw')}
               </button>
               <button
+                type="button"
                 onClick={() => onRespondDraw?.(false)}
                 className="px-3 py-1 rounded-lg bg-[#252D3D] text-[#F3EFE6] text-xs font-semibold"
               >
@@ -270,12 +335,17 @@ export const GameHUD: React.FC<GameHUDProps> = ({
 
       {/* Collapsible Side/Bottom Drawer for Move History or Safe Preset Chat */}
       {drawer !== 'none' && (
-        <div className="fixed bottom-24 right-4 z-30 w-80 max-w-[92vw] max-h-[52vh] rounded-2xl bg-[#121620]/96 border border-[#D4AF37]/30 shadow-2xl flex flex-col overflow-hidden">
+        <div
+          className={`fixed right-3 sm:right-4 z-30 w-80 max-w-[92vw] rounded-2xl bg-[#121620]/96 border border-[#D4AF37]/30 shadow-2xl flex flex-col overflow-hidden ${
+            UX_POLISH ? 'bottom-24 max-h-[50dvh]' : 'bottom-24 max-h-[52vh]'
+          }`}
+        >
           <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
             <span className="text-xs font-bold text-[#D4AF37]">
               {drawer === 'history' ? t(lang, 'history') : t(lang, 'chat')}
             </span>
             <button
+              type="button"
               onClick={() => setDrawer('none')}
               className="p-1.5 rounded-lg text-[#9AA3B2] hover:text-white"
             >
@@ -309,6 +379,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
                 <span>{t(lang, 'safeChatNotice')}</span>
                 <div className="flex items-center gap-1">
                   <button
+                    type="button"
                     onClick={onToggleMute}
                     title={onlineStatus?.muted ? t(lang, 'unmuteOpponent') : t(lang, 'muteOpponent')}
                     className="p-1.5 rounded hover:bg-white/10 text-[#9AA3B2] hover:text-white"
@@ -316,6 +387,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
                     <Ban className="w-3.5 h-3.5" />
                   </button>
                   <button
+                    type="button"
                     onClick={() => {
                       onReportOpponent?.();
                       setReported(true);
@@ -336,7 +408,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
               <div className="flex-1 overflow-y-auto custom-scrollbar p-3 space-y-2 min-h-[120px]">
                 {visibleChat.map((msg) => (
                   <div key={msg.id} className="text-xs">
-                    <span className={msg.senderColor === 'w' ? 'text-[#D4AF37] font-bold' : 'text-[#A855F7] font-bold'}>
+                    <span className={msg.senderColor === 'w' ? 'text-[#EF4444] font-bold' : 'text-[#A855F7] font-bold'}>
                       {msg.senderName}:{' '}
                     </span>
                     <span className="text-[#F3EFE6]">{t(lang, msg.presetKey as PresetChatKey)}</span>
@@ -346,6 +418,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
               <div className="p-2 border-t border-white/10 grid grid-cols-2 gap-1.5 bg-[#161B26]">
                 {PRESET_CHAT_KEYS.map((key) => (
                   <button
+                    type="button"
                     key={key}
                     onClick={() => onSendQuickChat?.(key)}
                     className="px-2 py-1.5 rounded-lg bg-[#1F2737] hover:bg-[#2A3449] text-[11px] text-[#F3EFE6] truncate text-left"
@@ -361,12 +434,13 @@ export const GameHUD: React.FC<GameHUDProps> = ({
 
       {/* Collapsible Unified Bottom Control Dock */}
       <div
-        className={`fixed bottom-4 left-1/2 -translate-x-1/2 z-20 transition-transform duration-200 max-w-[96vw] ${
+        className={`fixed ${bottomInsetClass} left-1/2 -translate-x-1/2 z-20 transition-transform duration-200 max-w-[96vw] ${
           dockCollapsed ? 'translate-y-[calc(100%-26px)]' : 'translate-y-0'
         }`}
       >
         <div className="flex justify-center mb-1">
           <button
+            type="button"
             onClick={() => setDockCollapsed((c) => !c)}
             className="px-3 py-1 rounded-t-lg bg-[#121620]/95 border border-b-0 border-[#D4AF37]/30 text-[11px] font-semibold text-[#D4AF37] flex items-center gap-1"
           >
@@ -375,8 +449,9 @@ export const GameHUD: React.FC<GameHUDProps> = ({
           </button>
         </div>
 
-        <div className="flex flex-wrap items-center justify-center gap-1.5 px-3 py-2 rounded-2xl bg-[#121620]/95 border border-[#D4AF37]/25 shadow-2xl">
+        <div className="flex flex-wrap items-center justify-center gap-1.5 px-2.5 sm:px-3 py-2 rounded-2xl bg-[#121620]/95 border border-[#D4AF37]/25 shadow-2xl">
           <button
+            type="button"
             onClick={onResetCamera}
             title={t(lang, 'resetCamera')}
             className="px-2.5 py-2 rounded-xl bg-[#181E2B] hover:bg-[#232B3D] text-xs font-semibold text-[#F3EFE6] flex items-center gap-1.5 min-h-[40px]"
@@ -386,6 +461,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
           </button>
 
           <button
+            type="button"
             onClick={() => onCameraPreset('top')}
             title={t(lang, 'camTop')}
             className="px-2.5 py-2 rounded-xl bg-[#181E2B] hover:bg-[#232B3D] text-xs font-semibold text-[#F3EFE6] flex items-center gap-1.5 min-h-[40px]"
@@ -395,6 +471,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
           </button>
 
           <button
+            type="button"
             onClick={onToggleCombatPace}
             className={`px-2.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 min-h-[40px] ${
               settings.combatPace === 'fast'
@@ -410,6 +487,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
 
           {onRequestHint && (
             <button
+              type="button"
               onClick={onRequestHint}
               disabled={aiThinking || Boolean(gameOver)}
               className="px-2.5 py-2 rounded-xl bg-[#181E2B] hover:bg-[#232B3D] text-xs font-semibold text-[#38BDF8] flex items-center gap-1.5 min-h-[40px] disabled:opacity-45"
@@ -421,6 +499,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
 
           {onUndo && (
             <button
+              type="button"
               onClick={onUndo}
               disabled={history.length === 0 || Boolean(gameOver)}
               className="px-2.5 py-2 rounded-xl bg-[#181E2B] hover:bg-[#232B3D] text-xs font-semibold text-[#F3EFE6] flex items-center gap-1.5 min-h-[40px] disabled:opacity-45"
@@ -431,6 +510,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
           )}
 
           <button
+            type="button"
             onClick={() => setDrawer((d) => (d === 'history' ? 'none' : 'history'))}
             className={`px-2.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 min-h-[40px] ${
               drawer === 'history' ? 'bg-[#D4AF37] text-[#0D1017]' : 'bg-[#181E2B] hover:bg-[#232B3D] text-[#F3EFE6]'
@@ -442,6 +522,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
 
           {mode === 'online' && (
             <button
+              type="button"
               onClick={() => setDrawer((d) => (d === 'chat' ? 'none' : 'chat'))}
               className={`px-2.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 min-h-[40px] ${
                 drawer === 'chat' ? 'bg-[#D4AF37] text-[#0D1017]' : 'bg-[#181E2B] hover:bg-[#232B3D] text-[#F3EFE6]'
@@ -453,6 +534,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
           )}
 
           <button
+            type="button"
             onClick={onToggleSound}
             aria-label={t(lang, 'soundFX')}
             className="p-2 rounded-xl bg-[#181E2B] hover:bg-[#232B3D] text-[#F3EFE6] min-h-[40px] min-w-[40px] flex items-center justify-center"
@@ -462,6 +544,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
 
           {mode !== 'online' ? (
             <button
+              type="button"
               onClick={onPauseToggle}
               aria-label={t(lang, 'pause')}
               className="p-2 rounded-xl bg-[#181E2B] hover:bg-[#232B3D] text-[#F3EFE6] min-h-[40px] min-w-[40px] flex items-center justify-center"
@@ -471,6 +554,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
           ) : (
             onOfferDraw && (
               <button
+                type="button"
                 onClick={onOfferDraw}
                 title={t(lang, 'offerDraw')}
                 className="p-2 rounded-xl bg-[#181E2B] hover:bg-[#232B3D] text-[#F3EFE6] min-h-[40px] min-w-[40px] flex items-center justify-center"
@@ -481,6 +565,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
           )}
 
           <button
+            type="button"
             onClick={() => setConfirmResign(true)}
             title={t(lang, 'resign')}
             className="p-2 rounded-xl bg-[#181E2B] hover:bg-rose-900/60 text-rose-300 min-h-[40px] min-w-[40px] flex items-center justify-center"
@@ -489,6 +574,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
           </button>
 
           <button
+            type="button"
             onClick={onOpenSettings}
             aria-label={t(lang, 'settings')}
             className="p-2 rounded-xl bg-[#181E2B] hover:bg-[#232B3D] text-[#F3EFE6] min-h-[40px] min-w-[40px] flex items-center justify-center"
@@ -497,6 +583,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
           </button>
 
           <button
+            type="button"
             onClick={onReturnMenu}
             aria-label={t(lang, 'returnMenu')}
             className="p-2 rounded-xl bg-[#181E2B] hover:bg-[#232B3D] text-[#9AA3B2] hover:text-white min-h-[40px] min-w-[40px] flex items-center justify-center"
@@ -508,13 +595,17 @@ export const GameHUD: React.FC<GameHUDProps> = ({
 
       {/* Pawn Promotion Modal */}
       {promotionPending && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4">
-          <div className="w-full max-w-sm rounded-2xl bg-[#121620] border border-[#D4AF37]/40 p-6 text-center space-y-4">
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="w-full max-w-sm max-h-[88dvh] overflow-y-auto rounded-2xl bg-[#121620] border border-[#D4AF37]/40 p-6 text-center space-y-4">
             <h3 className="font-display text-lg font-bold text-[#D4AF37]">{t(lang, 'promoteTitle')}</h3>
             <p className="text-xs text-[#9AA3B2]">{t(lang, 'promoteDesc')}</p>
             <div className="grid grid-cols-2 gap-2.5">
               {(['q', 'r', 'b', 'n'] as const).map((p) => (
                 <button
+                  type="button"
                   key={p}
                   onClick={() => onPromote(p)}
                   className="py-3 px-4 rounded-xl bg-[#181E2B] hover:bg-[#D4AF37] hover:text-[#0D1017] border border-white/15 text-sm font-bold text-[#F3EFE6] transition-colors flex items-center justify-center gap-2 min-h-[48px]"
@@ -535,12 +626,14 @@ export const GameHUD: React.FC<GameHUDProps> = ({
             <p className="text-sm font-semibold text-[#F3EFE6]">{t(lang, 'confirmResign')}</p>
             <div className="flex gap-3">
               <button
+                type="button"
                 onClick={() => setConfirmResign(false)}
                 className="flex-1 py-2.5 rounded-xl bg-[#181E2B] text-xs font-semibold text-[#F3EFE6] min-h-[44px]"
               >
                 {t(lang, 'close')}
               </button>
               <button
+                type="button"
                 onClick={() => {
                   setConfirmResign(false);
                   onResign();
@@ -561,12 +654,14 @@ export const GameHUD: React.FC<GameHUDProps> = ({
             <h3 className="font-display text-xl font-bold text-[#D4AF37]">{t(lang, 'pausedTitle')}</h3>
             <div className="space-y-2.5">
               <button
+                type="button"
                 onClick={onPauseToggle}
                 className="w-full py-3 rounded-xl bg-[#D4AF37] text-[#0D1017] font-bold text-sm min-h-[46px]"
               >
                 {t(lang, 'resume')}
               </button>
               <button
+                type="button"
                 onClick={onReturnMenu}
                 className="w-full py-3 rounded-xl bg-[#181E2B] border border-white/12 text-[#F3EFE6] font-semibold text-sm min-h-[46px]"
               >
@@ -580,22 +675,20 @@ export const GameHUD: React.FC<GameHUDProps> = ({
       {/* Game Over Victory / Summary Screen */}
       {gameOver && (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/75 p-4">
-          <div className="w-full max-w-md rounded-2xl bg-[#121620] border border-[#D4AF37]/40 p-6 shadow-2xl text-center space-y-5">
+          <div className="w-full max-w-md max-h-[88dvh] overflow-y-auto rounded-2xl bg-[#121620] border border-[#D4AF37]/40 p-6 shadow-2xl text-center space-y-5">
             <div className="mx-auto w-14 h-14 rounded-2xl bg-[#D4AF37]/15 border border-[#D4AF37]/40 flex items-center justify-center">
               <Crown className="w-8 h-8 text-[#D4AF37]" />
             </div>
 
             <div className="space-y-1">
-              <h2 className="font-display text-2xl font-bold text-[#F3EFE6]">
+              <h2 className="font-display text-xl sm:text-2xl font-bold text-[#F3EFE6]">
                 {gameOver.winner === 'w'
                   ? t(lang, 'victoryWhite')
                   : gameOver.winner === 'b'
                     ? t(lang, 'victoryBlack')
                     : t(lang, 'drawResult')}
               </h2>
-              <p className="text-xs font-semibold text-[#D4AF37]">
-                {t(lang, `reason_${gameOver.reason}`)}
-              </p>
+              <p className="text-xs font-semibold text-[#D4AF37]">{t(lang, `reason_${gameOver.reason}`)}</p>
             </div>
 
             <div className="grid grid-cols-3 gap-2 p-3 rounded-xl bg-[#181E2B] border border-white/10">
@@ -627,12 +720,14 @@ export const GameHUD: React.FC<GameHUDProps> = ({
 
             <div className="flex gap-3">
               <button
+                type="button"
                 onClick={onReturnMenu}
                 className="flex-1 py-3 rounded-xl bg-[#181E2B] border border-white/15 text-xs font-semibold text-[#F3EFE6] min-h-[46px]"
               >
                 {t(lang, 'returnMenu')}
               </button>
               <button
+                type="button"
                 onClick={onRematch}
                 disabled={onlineStatus?.rematchMine}
                 className="flex-1 py-3 rounded-xl bg-[#D4AF37] hover:bg-[#e5c150] text-[#0D1017] text-xs font-bold min-h-[46px] disabled:opacity-60"

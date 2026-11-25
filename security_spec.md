@@ -5,6 +5,7 @@
 2. **Leaderboard Integrity**: On creation, a player MUST start at `elo == 1200`, `wins == 0`, `losses == 0`, `draws == 0`, `gamesPlayed == 0`. Updates can either change `displayName`/`avatarHue` without touching stats, or increment `gamesPlayed` by exactly 1 with `elo` delta bounded to `[-64, +64]`.
 3. **Immutable Match History**: `/matches/{matchId}` records can only be created by the authenticated `ownerUid` with server timestamp `request.time`, and cannot be updated or deleted.
 4. **Write-Only Moderation Reports**: `/reports/{reportId}` can only be created by an authenticated reporter with their own `reporterUid`, and cannot be read or modified via client SDKs.
+5. **Host-Owned Online Room Config**: `/rooms/{roomCode}` can only be created by a verified authenticated host (`hostUid == request.auth.uid`) with `status == 'waiting'`, `hostColor != guestColor`, and `turnMinutes` clamped in `[0, 180]`. Guests/non-hosts cannot create or modify room settings; once created, `roomCode`, `hostUid`, `hostSideChoice`, `hostColor`, `guestColor`, `turnMinutes`, and `createdAt` are immutable. Only the host may transition `status` forward (`waiting` -> `playing`/`finished`, `playing` -> `finished`). `allow list: if false` prevents scraping active room codes.
 
 ## 2. Dirty Dozen Adversarial Payloads (All Must Return PERMISSION_DENIED)
 1. Unauthenticated write to `/leaderboard/u1`.
@@ -19,3 +20,7 @@
 10. Creating `/matches/m1` with a backdated `createdAt` not equal to `request.time`.
 11. Creating `/leaderboard/invalid$id!` with poisoned path ID characters or oversized strings.
 12. Reading `/reports` collection as a regular authenticated user.
+13. Guest / non-host updating `turnMinutes` or `hostColor` on `/rooms/ABC123`.
+14. Listing `/rooms` collection (active room code scraping).
+15. Creating `/rooms/ABC123` with `turnMinutes: 999` or `hostColor == guestColor`.
+16. Deleting `/rooms/ABC123` or reverting `status` from `'finished'` back to `'waiting'`.

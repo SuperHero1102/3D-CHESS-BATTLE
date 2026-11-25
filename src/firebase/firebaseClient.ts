@@ -295,3 +295,52 @@ export async function submitSafetyReport(roomCode: string, reason: string): Prom
     handleFirestoreError(err, OperationType.CREATE, path);
   }
 }
+
+export async function saveOnlineRoomConfig(params: {
+  user: User;
+  roomCode: string;
+  hostSideChoice: 'w' | 'b' | 'random';
+  hostColor: PieceColor;
+  turnMinutes: number;
+}): Promise<void> {
+  if (!params.user.emailVerified) return;
+  const code = params.roomCode.trim().toUpperCase();
+  if (!/^[A-Z0-9]{6}$/.test(code)) return;
+  const guestColor: PieceColor = params.hostColor === 'w' ? 'b' : 'w';
+  const clampedTurn = Math.max(0, Math.min(180, Math.floor(params.turnMinutes)));
+  const path = `rooms/${code}`;
+  try {
+    await setDoc(doc(db, 'rooms', code), {
+      roomCode: code,
+      hostUid: params.user.uid,
+      hostSideChoice: params.hostSideChoice,
+      hostColor: params.hostColor,
+      guestColor,
+      turnMinutes: clampedTurn,
+      status: 'waiting',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.CREATE, path);
+  }
+}
+
+export async function updateOnlineRoomStatus(
+  user: User | null,
+  roomCode: string,
+  status: 'playing' | 'finished'
+): Promise<void> {
+  if (!user || !user.emailVerified) return;
+  const code = roomCode.trim().toUpperCase();
+  if (!/^[A-Z0-9]{6}$/.test(code)) return;
+  const path = `rooms/${code}`;
+  try {
+    await updateDoc(doc(db, 'rooms', code), {
+      status,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, path);
+  }
+}

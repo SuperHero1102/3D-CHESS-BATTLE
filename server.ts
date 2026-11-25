@@ -64,6 +64,10 @@ interface RoomInternal {
     b: OnlinePlayerInternal | null;
   };
   timeControl: TimeControl;
+  turnMinutes?: number;
+  turnDeadlineAt: number | null;
+  hostColor: PieceColor;
+  hostSideChoice?: 'w' | 'b' | 'random';
   clocks: {
     w: number;
     b: number;
@@ -111,6 +115,11 @@ function sanitizeName(raw: unknown, fallback: string): string {
 }
 
 function serializeRoom(room: RoomInternal) {
+  const clocks = { ...room.clocks };
+  if (room.status === 'playing' && room.turnMinutes && room.turnMinutes > 0 && room.turnDeadlineAt) {
+    const activeTurn = room.chess.turn();
+    clocks[activeTurn] = Math.max(0, room.turnDeadlineAt - Date.now());
+  }
   return {
     roomCode: room.roomCode,
     status: room.status,
@@ -137,7 +146,11 @@ function serializeRoom(room: RoomInternal) {
         : null,
     },
     timeControl: room.timeControl,
-    clocks: { ...room.clocks },
+    turnMinutes: room.turnMinutes,
+    turnDeadlineAt: room.turnDeadlineAt,
+    hostColor: room.hostColor,
+    hostSideChoice: room.hostSideChoice,
+    clocks,
     history: room.history,
     lastMove: room.lastMove,
     pendingDrawFrom: room.pendingDrawFrom,
@@ -201,53 +214,108 @@ async function startServer() {
   app.use('/draco', express.static(path.resolve(__dirname, 'node_modules/three/examples/jsm/libs/draco')));
 
   io.on('connection', (socket) => {
-    socket.on('room:create', (payload: { playerName?: string; timeControl?: TimeControl }, ack) => {
-      const roomCode = generateRoomCode();
-      const token = crypto.randomUUID();
-      const publicId = crypto.randomUUID();
-      const tc: TimeControl = payload?.timeControl && typeof payload.timeControl.initialMs === 'number'
-        ? {
-            id: String(payload.timeControl.id || 'rapid10').slice(0, 16),
-            initialMs: Math.max(0, Math.min(3600000, payload.timeControl.initialMs)),
-            incrementMs: Math.max(0, Math.min(60000, payload.timeControl.incrementMs || 0)),
-          }
-        : { id: 'rapid10', initialMs: 10 * 60 * 1000, incrementMs: 0 };
-
-      const room: RoomInternal = {
-        roomCode,
-        status: 'waiting',
-        chess: new Chess(),
-        players: {
-          w: {
-            id: publicId,
-            token,
-            socketId: socket.id,
-            name: sanitizeName(payload?.playerName, 'White Commander'),
-            color: 'w',
-            ready: false,
-            connected: true,
-          },
-          b: null,
+    socket.on(
+      'room:create',
+      (
+        payload: {
+          playerName?: string;
+          timeControl?: TimeControl;
+          sideChoice?: 'w' | 'b' | 'random';
+          turnMinutes?: number;
         },
-        timeControl: tc,
-        clocks: { w: tc.initialMs, b: tc.initialMs },
-        lastTickAt: Date.now(),
-        startedAt: Date.now(),
-        history: [],
-        lastMove: null,
-        pendingDrawFrom: null,
-        rematchRequests: { w: false, b: false },
-        gameOver: null,
-        chat: [],
-        updatedAt: Date.now(),
-      };
+        ack
+      ) => {
+        const roomCode = generateRoomCode();
+        const token = crypto.randomUUID();
+        const publicId = crypto.randomUUID();
+        const isSetupV2 =
+          payload?.sideChoice !== undefined || typeof payload?.turnMinutes === 'number';
 
-      rooms.set(roomCode, room);
-      socket.join(roomCode);
-      if (typeof ack === 'function') {
-        ack({ ok: true, token, playerId: publicId, color: 'w', state: serializeRoom(room) });
+        let tc: TimeControl;
+        let turnMinutes: number | undefined;
+        let hostColor: PieceColor = 'w';
+        let hostSideChoice: 'w' | 'b' | 'random' | undefined;
+
+        if (isSetupV2) {
+          const rawMin =
+            typeof payload?.turnMinutes === 'number' && Number.isFinite(payload.turnMinutes)
+              ? Math.floor(payload.turnMinutes)
+              : 0;
+          turnMinutes = Math.max(0, Math.min(180, rawMin));
+          const turnMs = turnMinutes * 60 * 1000;
+          tc = {
+            id: turnMinutes > 0 ? `turn_${turnMinutes}m` : 'untimed',
+            initialMs: turnMs,
+            incrementMs: 0,
+          };
+          hostSideChoice =
+            payload?.sideChoice === 'b' || payload?.sideChoice === 'random' ? payload.sideChoice : 'w';
+          hostColor = hostSideChoice === 'random' ? (Math.random() < 0.5 ? 'w' : 'b') : hostSideChoice;
+        } else {
+          tc =
+            payload?.timeControl && typeof payload.timeControl.initialMs === 'number'
+              ? {
+                  id: String(payload.timeControl.id || 'rapid10').slice(0, 16),
+                  initialMs: Math.max(0, Math.min(3600000, payload.timeControl.initialMs)),
+                  incrementMs: Math.max(0, Math.min(60000, payload.timeControl.incrementMs || 0)),
+                }
+              : { id: 'rapid10', initialMs: 10 * 60 * 1000, incrementMs: 0 };
+        }
+
+        const defaultHostName = isSetupV2
+          ? hostColor === 'w'
+            ? 'Ánh Sáng (Quân Đỏ)'
+            : 'Bóng Đêm (Quân Tím)'
+          : 'White Commander';
+
+        const hostPlayer: OnlinePlayerInternal = {
+          id: publicId,
+          token,
+          socketId: socket.id,
+          name: sanitizeName(payload?.playerName, defaultHostName),
+          color: hostColor,
+          ready: false,
+          connected: true,
+        };
+
+        const room: RoomInternal = {
+          roomCode,
+          status: 'waiting',
+          chess: new Chess(),
+          players: {
+            w: hostColor === 'w' ? hostPlayer : null,
+            b: hostColor === 'b' ? hostPlayer : null,
+          },
+          timeControl: tc,
+          turnMinutes,
+          turnDeadlineAt: null,
+          hostColor,
+          hostSideChoice,
+          clocks: { w: tc.initialMs, b: tc.initialMs },
+          lastTickAt: Date.now(),
+          startedAt: Date.now(),
+          history: [],
+          lastMove: null,
+          pendingDrawFrom: null,
+          rematchRequests: { w: false, b: false },
+          gameOver: null,
+          chat: [],
+          updatedAt: Date.now(),
+        };
+
+        rooms.set(roomCode, room);
+        socket.join(roomCode);
+        if (typeof ack === 'function') {
+          ack({ ok: true, token, playerId: publicId, color: hostColor, state: serializeRoom(room) });
+        }
+        io.to(roomCode).emit('room:state', serializeRoom(room));
       }
-      io.to(roomCode).emit('room:state', serializeRoom(room));
+    );
+
+    socket.on('room:update_config', (_payload: unknown, ack) => {
+      if (typeof ack === 'function') {
+        ack({ ok: false, error: 'setup_locked' });
+      }
     });
 
     socket.on('room:join', (payload: { roomCode?: string; playerName?: string; token?: string }, ack) => {
@@ -287,11 +355,19 @@ async function startServer() {
       const assignedColor: PieceColor = room.players.w ? 'b' : 'w';
       const token = crypto.randomUUID();
       const publicId = crypto.randomUUID();
+      const fallbackName =
+        room.turnMinutes !== undefined
+          ? assignedColor === 'w'
+            ? 'Ánh Sáng (Quân Đỏ)'
+            : 'Bóng Đêm (Quân Tím)'
+          : assignedColor === 'w'
+            ? 'White Commander'
+            : 'Black Commander';
       room.players[assignedColor] = {
         id: publicId,
         token,
         socketId: socket.id,
-        name: sanitizeName(payload?.playerName, assignedColor === 'w' ? 'White Commander' : 'Black Commander'),
+        name: sanitizeName(payload?.playerName, fallbackName),
         color: assignedColor,
         ready: false,
         connected: true,
@@ -342,9 +418,15 @@ async function startServer() {
       room.updatedAt = Date.now();
 
       if (room.players.w?.ready && room.players.b?.ready) {
+        const now = Date.now();
         room.status = 'playing';
-        room.startedAt = Date.now();
-        room.lastTickAt = Date.now();
+        room.startedAt = now;
+        room.lastTickAt = now;
+        if (room.turnMinutes !== undefined) {
+          const turnMs = room.turnMinutes * 60 * 1000;
+          room.clocks = { w: turnMs, b: turnMs };
+          room.turnDeadlineAt = turnMs > 0 ? now + turnMs : null;
+        }
       }
       io.to(code).emit('room:state', serializeRoom(room));
     });
@@ -370,7 +452,25 @@ async function startServer() {
 
         // Update clock for active side before validating move
         const now = Date.now();
-        if (room.timeControl.initialMs > 0) {
+        if (room.turnMinutes !== undefined) {
+          if (room.turnMinutes > 0) {
+            const remaining = room.turnDeadlineAt ? Math.max(0, room.turnDeadlineAt - now) : room.clocks[player.color];
+            if (remaining <= 0) {
+              room.clocks[player.color] = 0;
+              room.turnDeadlineAt = null;
+              room.status = 'finished';
+              room.gameOver = {
+                winner: player.color === 'w' ? 'b' : 'w',
+                reason: 'timeout',
+                movesCount: room.history.length,
+                durationSec: Math.max(1, Math.round((now - room.startedAt) / 1000)),
+              };
+              io.to(code).emit('room:state', serializeRoom(room));
+              if (typeof ack === 'function') ack({ ok: false, error: 'timeout' });
+              return;
+            }
+          }
+        } else if (room.timeControl.initialMs > 0) {
           const elapsed = Math.max(0, now - room.lastTickAt);
           room.clocks[player.color] = Math.max(0, room.clocks[player.color] - elapsed);
           if (room.clocks[player.color] <= 0) {
@@ -398,9 +498,6 @@ async function startServer() {
             return;
           }
 
-          if (room.timeControl.initialMs > 0) {
-            room.clocks[player.color] += room.timeControl.incrementMs;
-          }
           room.lastTickAt = now;
           room.pendingDrawFrom = null;
           room.lastMove = { from: result.from, to: result.to };
@@ -423,6 +520,13 @@ async function startServer() {
           if (ended) {
             room.status = 'finished';
             room.gameOver = ended;
+            room.turnDeadlineAt = null;
+          } else if (room.turnMinutes !== undefined) {
+            const turnMs = room.turnMinutes * 60 * 1000;
+            room.clocks = { w: turnMs, b: turnMs };
+            room.turnDeadlineAt = turnMs > 0 ? now + turnMs : null;
+          } else if (room.timeControl.initialMs > 0) {
+            room.clocks[player.color] += room.timeControl.incrementMs;
           }
 
           io.to(code).emit('room:move_applied', {
@@ -522,11 +626,18 @@ async function startServer() {
           room.players.w = oldB;
           room.players.b = oldW;
         }
+        const now = Date.now();
         room.chess = new Chess();
         room.status = 'playing';
-        room.clocks = { w: room.timeControl.initialMs, b: room.timeControl.initialMs };
-        room.lastTickAt = Date.now();
-        room.startedAt = Date.now();
+        if (room.turnMinutes !== undefined) {
+          const turnMs = room.turnMinutes * 60 * 1000;
+          room.clocks = { w: turnMs, b: turnMs };
+          room.turnDeadlineAt = turnMs > 0 ? now + turnMs : null;
+        } else {
+          room.clocks = { w: room.timeControl.initialMs, b: room.timeControl.initialMs };
+        }
+        room.lastTickAt = now;
+        room.startedAt = now;
         room.history = [];
         room.lastMove = null;
         room.pendingDrawFrom = null;
@@ -570,23 +681,38 @@ async function startServer() {
     });
   });
 
-  // Authoritative clock timeout & room GC interval
+  // Authoritative clock timeout & room GC interval (500ms precision)
   setInterval(() => {
     const now = Date.now();
     for (const [code, room] of rooms.entries()) {
-      if (room.status === 'playing' && room.timeControl.initialMs > 0) {
+      if (room.status === 'playing') {
         const activeColor = room.chess.turn();
-        const elapsed = now - room.lastTickAt;
-        if (room.clocks[activeColor] - elapsed <= 0) {
-          room.clocks[activeColor] = 0;
-          room.status = 'finished';
-          room.gameOver = {
-            winner: activeColor === 'w' ? 'b' : 'w',
-            reason: 'timeout',
-            movesCount: room.history.length,
-            durationSec: Math.max(1, Math.round((now - room.startedAt) / 1000)),
-          };
-          io.to(code).emit('room:state', serializeRoom(room));
+        if (room.turnMinutes !== undefined) {
+          if (room.turnMinutes > 0 && room.turnDeadlineAt && now >= room.turnDeadlineAt) {
+            room.clocks[activeColor] = 0;
+            room.turnDeadlineAt = null;
+            room.status = 'finished';
+            room.gameOver = {
+              winner: activeColor === 'w' ? 'b' : 'w',
+              reason: 'timeout',
+              movesCount: room.history.length,
+              durationSec: Math.max(1, Math.round((now - room.startedAt) / 1000)),
+            };
+            io.to(code).emit('room:state', serializeRoom(room));
+          }
+        } else if (room.timeControl.initialMs > 0) {
+          const elapsed = now - room.lastTickAt;
+          if (room.clocks[activeColor] - elapsed <= 0) {
+            room.clocks[activeColor] = 0;
+            room.status = 'finished';
+            room.gameOver = {
+              winner: activeColor === 'w' ? 'b' : 'w',
+              reason: 'timeout',
+              movesCount: room.history.length,
+              durationSec: Math.max(1, Math.round((now - room.startedAt) / 1000)),
+            };
+            io.to(code).emit('room:state', serializeRoom(room));
+          }
         }
       }
       // Clean up idle rooms older than 60 minutes
@@ -594,7 +720,7 @@ async function startServer() {
         rooms.delete(code);
       }
     }
-  }, 1000);
+  }, 500);
 
   const isProd = process.env.NODE_ENV === 'production';
   if (!isProd) {

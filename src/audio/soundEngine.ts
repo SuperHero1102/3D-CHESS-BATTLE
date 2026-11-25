@@ -5,17 +5,52 @@ class MedievalSoundEngine {
   private enabled = true;
   private volume = 0.65;
 
+  private unlockInstalled = false;
+
   private ensureContext(): AudioContext | null {
     if (!this.enabled || typeof window === 'undefined') return null;
-    if (!this.ctx) {
-      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-      if (!AudioCtx) return null;
-      this.ctx = new AudioCtx();
+    try {
+      if (!this.ctx) {
+        const AudioCtx =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+        if (!AudioCtx) return null;
+        this.ctx = new AudioCtx();
+      }
+      if (this.ctx.state === 'suspended') {
+        this.ctx.resume().catch(() => {});
+      }
+      return this.ctx;
+    } catch {
+      return null;
     }
-    if (this.ctx.state === 'suspended') {
-      this.ctx.resume().catch(() => {});
-    }
-    return this.ctx;
+  }
+
+  public installAudioUnlock(): () => void {
+    if (typeof window === 'undefined' || this.unlockInstalled) return () => {};
+    this.unlockInstalled = true;
+    const handleUnlock = () => {
+      try {
+        if (!this.enabled) return;
+        const ctx = this.ensureContext();
+        if (ctx && ctx.state === 'suspended') {
+          ctx.resume().catch(() => {});
+        }
+      } catch {
+        // Ignore iOS Safari / restricted autoplay rejections silently
+      }
+      window.removeEventListener('pointerdown', handleUnlock);
+      window.removeEventListener('touchstart', handleUnlock);
+      window.removeEventListener('keydown', handleUnlock);
+    };
+    window.addEventListener('pointerdown', handleUnlock, { passive: true, once: true });
+    window.addEventListener('touchstart', handleUnlock, { passive: true, once: true });
+    window.addEventListener('keydown', handleUnlock, { passive: true, once: true });
+    return () => {
+      window.removeEventListener('pointerdown', handleUnlock);
+      window.removeEventListener('touchstart', handleUnlock);
+      window.removeEventListener('keydown', handleUnlock);
+    };
   }
 
   public configure(enabled: boolean, volume: number) {

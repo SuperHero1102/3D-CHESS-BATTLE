@@ -18,7 +18,9 @@ import {
 } from './types/chess';
 import { LEARN_LESSONS, PresetChatKey, t } from './i18n/translations';
 import { soundEngine } from './audio/soundEngine';
+import { SETUP_V2, UX_POLISH } from './config/featureFlags';
 import { ChessArena3D } from './three/ChessArena3D';
+import { getGlbLoadProgressSnapshot, subscribeGlbProgress } from './three/modelLoader';
 import { PieceGallery3D } from './three/PieceGallery3D';
 import { MainMenu } from './components/MainMenu';
 import { MatchSetupModal } from './components/MatchSetupModal';
@@ -31,25 +33,51 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import {
   ensureUserProfile,
   recordMatchResult,
+  saveOnlineRoomConfig,
   signInWithGoogle,
   signOutUser,
   submitSafetyReport,
   subscribeAuth,
   testFirestoreConnection,
+  updateOnlineRoomStatus,
 } from './firebase/firebaseClient';
 
 const SETTINGS_KEY = 'chess_battle_settings_v1';
 const ONLINE_SESSION_KEY = 'chess_battle_online_session_v1';
 
+function safeSessionGet(key: string): string | null {
+  try {
+    return typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(key) : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeSessionSet(key: string, value: string): void {
+  try {
+    if (typeof sessionStorage !== 'undefined') sessionStorage.setItem(key, value);
+  } catch {
+    // ignore storage errors in restricted iframes / Incognito
+  }
+}
+
+function safeSessionRemove(key: string): void {
+  try {
+    if (typeof sessionStorage !== 'undefined') sessionStorage.removeItem(key);
+  } catch {
+    // ignore storage errors in restricted iframes / Incognito
+  }
+}
+
 function getDefaultSettings(): GameSettings {
-  const isTouch = typeof window !== 'undefined' && window.matchMedia('(pointer: coarse)').matches;
-  const saved = typeof localStorage !== 'undefined' ? localStorage.getItem(SETTINGS_KEY) : null;
-  if (saved) {
-    try {
+  const isTouch = typeof window !== 'undefined' && window.matchMedia?.('(pointer: coarse)').matches;
+  try {
+    const saved = typeof localStorage !== 'undefined' ? localStorage.getItem(SETTINGS_KEY) : null;
+    if (saved) {
       return JSON.parse(saved) as GameSettings;
-    } catch {
-      // ignore corrupt storage
     }
+  } catch {
+    // ignore corrupt or denied storage in Incognito iframes
   }
   return {
     language: 'vi',
@@ -85,6 +113,9 @@ export default function App() {
     if (typeof window === 'undefined') return false;
     return new URLSearchParams(window.location.search).get('gallery') === '1';
   });
+  const [firstLoadBlocking, setFirstLoadBlocking] = useState<boolean>(
+    () => getGlbLoadProgressSnapshot().isFirstLoadBlocking
+  );
 
   // Firebase Auth & Profile
   const [user, setUser] = useState<User | null>(null);
@@ -105,15 +136,19 @@ export default function App() {
   const [playerSide, setPlayerSide] = useState<PieceColor>('w');
   const [aiDifficulty, setAiDifficulty] = useState<AIDifficulty>('medium');
   const [aiThinking, setAiThinking] = useState(false);
-  const [whiteName, setWhiteName] = useState('Vương Quốc Ánh Sáng');
-  const [blackName, setBlackName] = useState('Vương Quốc Bóng Đêm');
+  const [whiteName, setWhiteName] = useState(() => t(getDefaultSettings().language, 'whiteKingdom'));
+  const [blackName, setBlackName] = useState(() => t(getDefaultSettings().language, 'blackKingdom'));
   const [timeControl, setTimeControl] = useState<TimeControl>(TIME_CONTROLS[2]);
+  const [turnMinutes, setTurnMinutes] = useState<number>(0);
   const [whiteClockMs, setWhiteClockMs] = useState(10 * 60 * 1000);
   const [blackClockMs, setBlackClockMs] = useState(10 * 60 * 1000);
   const [paused, setPaused] = useState(false);
   const [gameOver, setGameOver] = useState<GameOverInfo | null>(null);
   const matchStartRef = useRef<number>(Date.now());
   const savedResultRef = useRef<boolean>(false);
+  const turnDeadlineAtRef = useRef<number | null>(null);
+  const pausedRemainingMsRef = useRef<number | null>(null);
+  const legacyTurnRemainingRef = useRef<{ w: number; b: number }>({ w: 10 * 60 * 1000, b: 10 * 60 * 1000 });
 
   // Promotion pending state
   const [pendingPromotion, setPendingPromotion] = useState<{ from: string; to: string } | null>(null);
@@ -133,6 +168,10 @@ export default function App() {
   const modeRef = useRef<GameMode>(mode);
   modeRef.current = mode;
   const onlinePublicIdRef = useRef<string | null>(null);
+  const onlineColorRef = useRef<PieceColor | null>(null);
+  const userRef = useRef<User | null>(user);
+  userRef.current = user;
+  const lastSyncedRoomStatusRef = useRef<string>('');
   const playedEndSoundRef = useRef<boolean>(false);
   const [initialRoomCode] = useState<string>(() => {
     if (typeof window === 'undefined') return '';
@@ -140,7 +179,9 @@ export default function App() {
   });
   const [roomState, setRoomState] = useState<OnlineRoomState | null>(null);
   const [onlineColor, setOnlineColor] = useState<PieceColor | null>(null);
+  onlineColorRef.current = onlineColor;
   const [onlineError, setOnlineError] = useState<string | null>(null);
+  const [socketReconnecting, setSocketReconnecting] = useState(false);
   const [mutedOpponent, setMutedOpponent] = useState(false);
 
   // AI Web Worker
@@ -156,6 +197,17 @@ export default function App() {
       // ignore storage errors
     }
   }, [settings]);
+
+  useEffect(() => {
+    if (!UX_POLISH) return;
+    return soundEngine.installAudioUnlock();
+  }, []);
+
+  useEffect(() => {
+    return subscribeGlbProgress((snap) => {
+      setFirstLoadBlocking(snap.isFirstLoadBlocking);
+    });
+  }, []);
 
   // Firebase Auth subscription & startup test
   useEffect(() => {
@@ -178,10 +230,15 @@ export default function App() {
 
   // Initialize AI Web Worker
   useEffect(() => {
-    const worker = new Worker(new URL('./workers/chessAI.worker.ts', import.meta.url), { type: 'module' });
-    workerRef.current = worker;
+    let worker: Worker | null = null;
+    try {
+      worker = new Worker(new URL('./workers/chessAI.worker.ts', import.meta.url), { type: 'module' });
+      workerRef.current = worker;
+    } catch {
+      workerRef.current = null;
+    }
     return () => {
-      worker.terminate();
+      worker?.terminate();
       workerRef.current = null;
     };
   }, []);
@@ -191,8 +248,19 @@ export default function App() {
     const socket = io({ autoConnect: true, reconnection: true });
     socketRef.current = socket;
 
+    const syncFirestoreRoomStatus = (state: OnlineRoomState, resolvedColor: PieceColor | null) => {
+      if (!SETUP_V2 || !userRef.current?.emailVerified) return;
+      if (state.status !== 'playing' && state.status !== 'finished') return;
+      if (!state.hostColor || state.hostColor !== resolvedColor) return;
+      const syncKey = `${state.roomCode}:${state.status}`;
+      if (lastSyncedRoomStatusRef.current === syncKey) return;
+      lastSyncedRoomStatusRef.current = syncKey;
+      updateOnlineRoomStatus(userRef.current, state.roomCode, state.status).catch(() => {});
+    };
+
     socket.on('connect', () => {
-      const saved = sessionStorage.getItem(ONLINE_SESSION_KEY);
+      setSocketReconnecting(false);
+      const saved = safeSessionGet(ONLINE_SESSION_KEY);
       if (saved) {
         try {
           const { roomCode, token } = JSON.parse(saved) as { roomCode: string; token: string };
@@ -216,14 +284,30 @@ export default function App() {
                   setSetupModal('none');
                 }
               } else {
-                sessionStorage.removeItem(ONLINE_SESSION_KEY);
+                safeSessionRemove(ONLINE_SESSION_KEY);
               }
             }
           );
         } catch {
-          sessionStorage.removeItem(ONLINE_SESSION_KEY);
+          safeSessionRemove(ONLINE_SESSION_KEY);
         }
       }
+    });
+
+    socket.on('disconnect', () => {
+      setSocketReconnecting(true);
+    });
+
+    socket.on('connect_error', () => {
+      setSocketReconnecting(true);
+    });
+
+    socket.io.on('reconnect_attempt', () => {
+      setSocketReconnecting(true);
+    });
+
+    socket.io.on('reconnect', () => {
+      setSocketReconnecting(false);
     });
 
     socket.on('room:state', (state: OnlineRoomState) => {
@@ -232,10 +316,18 @@ export default function App() {
       setBlackClockMs(state.clocks.b);
       setGameOver(state.gameOver);
 
+      let resolvedColor = onlineColorRef.current;
       if (onlinePublicIdRef.current) {
-        if (state.players.w?.id === onlinePublicIdRef.current) setOnlineColor('w');
-        else if (state.players.b?.id === onlinePublicIdRef.current) setOnlineColor('b');
+        if (state.players.w?.id === onlinePublicIdRef.current) {
+          resolvedColor = 'w';
+          setOnlineColor('w');
+        } else if (state.players.b?.id === onlinePublicIdRef.current) {
+          resolvedColor = 'b';
+          setOnlineColor('b');
+        }
       }
+
+      syncFirestoreRoomStatus(state, resolvedColor);
 
       if (state.status === 'playing' && modeRef.current !== 'online') {
         chessRef.current = new Chess(state.fen);
@@ -273,6 +365,7 @@ export default function App() {
       setWhiteClockMs(state.clocks.w);
       setBlackClockMs(state.clocks.b);
       setGameOver(state.gameOver);
+      syncFirestoreRoomStatus(state, onlineColorRef.current);
 
       moveSeqRef.current += 1;
       setLatestMoveEvent({ seq: moveSeqRef.current, move });
@@ -325,7 +418,7 @@ export default function App() {
       mode === 'ai'
         ? `AI (${aiDifficulty.toUpperCase()})`
         : mode === 'online'
-          ? (myCol === 'w' ? roomState?.players.b?.name : roomState?.players.w?.name) || 'Online Opponent'
+          ? (myCol === 'w' ? roomState?.players.b?.name : roomState?.players.w?.name) || t(settings.language, 'player')
           : blackName;
 
     const oppElo = mode === 'ai' ? (aiDifficulty === 'easy' ? 1050 : aiDifficulty === 'medium' ? 1250 : 1480) : 1200;
@@ -350,16 +443,88 @@ export default function App() {
         setGameOver((prev) => (prev ? { ...prev, eloDelta } : prev));
       })
       .catch((err) => console.error(err));
-  }, [gameOver, user, mode, onlineColor, playerSide, aiDifficulty, roomState, blackName, history]);
+  }, [gameOver, user, mode, onlineColor, playerSide, aiDifficulty, roomState, blackName, history, settings.language]);
 
-  // Active Clock Ticker (Local / AI / Online visual interpolation)
+  // Freeze/resume timestamp clock during Pause or 3D Combat (UX_POLISH)
+  useEffect(() => {
+    if (!UX_POLISH) return;
+    if (mode !== 'local' && mode !== 'ai') return;
+    if (gameOver) {
+      turnDeadlineAtRef.current = null;
+      pausedRemainingMsRef.current = null;
+      return;
+    }
+    if (paused || combatActive) {
+      if (turnDeadlineAtRef.current !== null) {
+        pausedRemainingMsRef.current = Math.max(0, turnDeadlineAtRef.current - Date.now());
+        turnDeadlineAtRef.current = null;
+      }
+    } else if (pausedRemainingMsRef.current !== null) {
+      turnDeadlineAtRef.current = Date.now() + pausedRemainingMsRef.current;
+      pausedRemainingMsRef.current = null;
+    }
+  }, [paused, combatActive, mode, gameOver]);
+
+  // Active Clock Ticker (Timestamp-driven under UX_POLISH, legacy 250ms under rollback)
   useEffect(() => {
     if (mode !== 'local' && mode !== 'ai' && mode !== 'online') return;
-    if (timeControl.initialMs <= 0 && mode !== 'online') return;
+    const isUntimedLocal = SETUP_V2 ? turnMinutes === 0 : timeControl.initialMs <= 0;
+    if (isUntimedLocal && mode !== 'online') return;
     if (mode === 'online' && (!roomState || roomState.timeControl.initialMs <= 0 || roomState.status !== 'playing')) return;
     if (paused || gameOver || combatActive) return;
 
     const turn = chessRef.current.turn();
+
+    if (UX_POLISH) {
+      const onlineBaseNow = Date.now();
+      const onlineStartMs = roomState ? roomState.clocks[roomState.turn] : 0;
+
+      const syncClock = () => {
+        const now = Date.now();
+        if (mode === 'online') {
+          if (!roomState || roomState.status !== 'playing') return;
+          if (SETUP_V2 && roomState.turnDeadlineAt) {
+            const rem = Math.max(0, roomState.turnDeadlineAt - now);
+            if (roomState.turn === 'w') setWhiteClockMs(rem);
+            else setBlackClockMs(rem);
+          } else {
+            const rem = Math.max(0, onlineStartMs - (now - onlineBaseNow));
+            if (roomState.turn === 'w') setWhiteClockMs(rem);
+            else setBlackClockMs(rem);
+          }
+          return;
+        }
+
+        if (turnDeadlineAtRef.current === null) return;
+        const rem = Math.max(0, turnDeadlineAtRef.current - now);
+        if (turn === 'w') {
+          setWhiteClockMs(rem);
+        } else {
+          setBlackClockMs(rem);
+        }
+        if (rem === 0) {
+          turnDeadlineAtRef.current = null;
+          setGameOver({
+            winner: turn === 'w' ? 'b' : 'w',
+            reason: 'timeout',
+            movesCount: history.length,
+            durationSec: Math.max(1, Math.round((now - matchStartRef.current) / 1000)),
+          });
+        }
+      };
+
+      syncClock();
+      const interval = window.setInterval(syncClock, 100);
+      const onVis = () => {
+        if (!document.hidden) syncClock();
+      };
+      document.addEventListener('visibilitychange', onVis);
+      return () => {
+        window.clearInterval(interval);
+        document.removeEventListener('visibilitychange', onVis);
+      };
+    }
+
     const interval = setInterval(() => {
       if (turn === 'w') {
         setWhiteClockMs((prev) => {
@@ -391,7 +556,7 @@ export default function App() {
     }, 250);
 
     return () => clearInterval(interval);
-  }, [mode, fen, paused, gameOver, combatActive, timeControl.initialMs, roomState, history.length]);
+  }, [mode, fen, paused, gameOver, combatActive, timeControl.initialMs, turnMinutes, roomState, history.length]);
 
   const checkLocalGameEnd = useCallback(
     (chess: Chess, movesCount: number): GameOverInfo | null => {
@@ -419,11 +584,6 @@ export default function App() {
       try {
         const result: Move | null = chess.move({ from, to, promotion });
         if (!result) return false;
-
-        if (timeControl.initialMs > 0) {
-          if (result.color === 'w') setWhiteClockMs((c) => c + timeControl.incrementMs);
-          else setBlackClockMs((c) => c + timeControl.incrementMs);
-        }
 
         const record: MoveRecord = {
           san: result.san,
@@ -470,14 +630,51 @@ export default function App() {
 
         const ended = checkLocalGameEnd(chess, nextHistory.length);
         if (ended) {
+          turnDeadlineAtRef.current = null;
+          pausedRemainingMsRef.current = null;
           setGameOver(ended);
+        } else if (SETUP_V2) {
+          if (turnMinutes > 0) {
+            const turnMs = turnMinutes * 60 * 1000;
+            setWhiteClockMs(turnMs);
+            setBlackClockMs(turnMs);
+            if (result.captured && UX_POLISH) {
+              // Combat starts right after capture; hold fresh per-turn allowance until combat ends
+              turnDeadlineAtRef.current = null;
+              pausedRemainingMsRef.current = turnMs;
+            } else {
+              turnDeadlineAtRef.current = Date.now() + turnMs;
+              pausedRemainingMsRef.current = null;
+            }
+          } else {
+            turnDeadlineAtRef.current = null;
+            pausedRemainingMsRef.current = null;
+          }
+        } else if (timeControl.initialMs > 0) {
+          const mover = result.color;
+          const nextTurn = chess.turn();
+          const prevMoverRem =
+            turnDeadlineAtRef.current !== null
+              ? Math.max(0, turnDeadlineAtRef.current - Date.now())
+              : legacyTurnRemainingRef.current[mover];
+          legacyTurnRemainingRef.current[mover] = prevMoverRem + timeControl.incrementMs;
+          if (mover === 'w') setWhiteClockMs(legacyTurnRemainingRef.current.w);
+          else setBlackClockMs(legacyTurnRemainingRef.current.b);
+          const nextRem = legacyTurnRemainingRef.current[nextTurn];
+          if (result.captured && UX_POLISH) {
+            turnDeadlineAtRef.current = null;
+            pausedRemainingMsRef.current = nextRem;
+          } else {
+            turnDeadlineAtRef.current = Date.now() + nextRem;
+            pausedRemainingMsRef.current = null;
+          }
         }
         return true;
       } catch {
         return false;
       }
     },
-    [checkLocalGameEnd, history, lessonIndex, mode, timeControl]
+    [checkLocalGameEnd, history, lessonIndex, mode, timeControl, turnMinutes]
   );
 
   // Trigger AI move when it's AI's turn
@@ -649,6 +846,7 @@ export default function App() {
     wName: string;
     bName: string;
     tc: TimeControl;
+    turnMinutes?: number;
   }) => {
     chessRef.current = new Chess();
     setFen(chessRef.current.fen());
@@ -663,13 +861,28 @@ export default function App() {
     playedEndSoundRef.current = false;
     matchStartRef.current = Date.now();
 
+    const nextTurnMinutes = opts.turnMinutes ?? 0;
     setPlayerSide(opts.side);
     if (opts.difficulty) setAiDifficulty(opts.difficulty);
     setWhiteName(opts.wName);
     setBlackName(opts.bName);
     setTimeControl(opts.tc);
-    setWhiteClockMs(opts.tc.initialMs);
-    setBlackClockMs(opts.tc.initialMs);
+    setTurnMinutes(nextTurnMinutes);
+
+    if (SETUP_V2) {
+      const turnMs = nextTurnMinutes * 60 * 1000;
+      setWhiteClockMs(turnMs);
+      setBlackClockMs(turnMs);
+      turnDeadlineAtRef.current = turnMs > 0 ? Date.now() + turnMs : null;
+      pausedRemainingMsRef.current = null;
+    } else {
+      setWhiteClockMs(opts.tc.initialMs);
+      setBlackClockMs(opts.tc.initialMs);
+      legacyTurnRemainingRef.current = { w: opts.tc.initialMs, b: opts.tc.initialMs };
+      turnDeadlineAtRef.current = opts.tc.initialMs > 0 ? Date.now() + opts.tc.initialMs : null;
+      pausedRemainingMsRef.current = null;
+    }
+
     setCameraPreset('default');
     setCameraResetTrigger((c) => c + 1);
     setMode(opts.targetMode);
@@ -708,20 +921,50 @@ export default function App() {
     const prevLast = nextHistory[nextHistory.length - 1];
     setLastMove(prevLast ? { from: prevLast.from, to: prevLast.to } : null);
     setLatestMoveEvent(null);
+    if (SETUP_V2 && turnMinutes > 0) {
+      const turnMs = turnMinutes * 60 * 1000;
+      setWhiteClockMs(turnMs);
+      setBlackClockMs(turnMs);
+      turnDeadlineAtRef.current = Date.now() + turnMs;
+      pausedRemainingMsRef.current = null;
+    }
   };
 
   // Online Actions
-  const handleCreateRoom = (name: string, tc: TimeControl) => {
+  const handleCreateRoom = (
+    name: string,
+    tc: TimeControl,
+    opts?: { sideChoice?: 'w' | 'b' | 'random'; turnMinutes?: number }
+  ) => {
     setOnlineError(null);
+    lastSyncedRoomStatusRef.current = '';
+    const payload = SETUP_V2
+      ? {
+          playerName: name,
+          timeControl: tc,
+          sideChoice: opts?.sideChoice ?? 'w',
+          turnMinutes: opts?.turnMinutes ?? 0,
+        }
+      : { playerName: name, timeControl: tc };
+
     socketRef.current?.emit(
       'room:create',
-      { playerName: name, timeControl: tc },
+      payload,
       (res: { ok: boolean; token?: string; playerId?: string; color?: PieceColor; state?: OnlineRoomState }) => {
         if (res?.ok && res.token && res.color && res.state) {
           if (res.playerId) onlinePublicIdRef.current = res.playerId;
-          sessionStorage.setItem(ONLINE_SESSION_KEY, JSON.stringify({ roomCode: res.state.roomCode, token: res.token }));
+          safeSessionSet(ONLINE_SESSION_KEY, JSON.stringify({ roomCode: res.state.roomCode, token: res.token }));
           setOnlineColor(res.color);
           setRoomState(res.state);
+          if (SETUP_V2 && userRef.current?.emailVerified) {
+            saveOnlineRoomConfig({
+              user: userRef.current,
+              roomCode: res.state.roomCode,
+              hostSideChoice: opts?.sideChoice ?? 'w',
+              hostColor: res.color,
+              turnMinutes: res.state.turnMinutes ?? opts?.turnMinutes ?? 0,
+            }).catch(() => {});
+          }
         } else {
           setOnlineError(t(settings.language, 'connectionError'));
         }
@@ -731,13 +974,14 @@ export default function App() {
 
   const handleJoinRoom = (code: string, name: string) => {
     setOnlineError(null);
+    lastSyncedRoomStatusRef.current = '';
     socketRef.current?.emit(
       'room:join',
       { roomCode: code.trim().toUpperCase(), playerName: name },
       (res: { ok: boolean; error?: string; token?: string; playerId?: string; color?: PieceColor; state?: OnlineRoomState }) => {
         if (res?.ok && res.token && res.color && res.state) {
           if (res.playerId) onlinePublicIdRef.current = res.playerId;
-          sessionStorage.setItem(ONLINE_SESSION_KEY, JSON.stringify({ roomCode: res.state.roomCode, token: res.token }));
+          safeSessionSet(ONLINE_SESSION_KEY, JSON.stringify({ roomCode: res.state.roomCode, token: res.token }));
           setOnlineColor(res.color);
           setRoomState(res.state);
         } else if (res?.error === 'room_full') {
@@ -753,7 +997,7 @@ export default function App() {
     if (roomState) {
       socketRef.current?.emit('room:leave', { roomCode: roomState.roomCode });
     }
-    sessionStorage.removeItem(ONLINE_SESSION_KEY);
+    safeSessionRemove(ONLINE_SESSION_KEY);
     onlinePublicIdRef.current = null;
     playedEndSoundRef.current = false;
     setRoomState(null);
@@ -799,13 +1043,29 @@ export default function App() {
     mode === 'online' ? onlineColor || 'w' : mode === 'ai' ? playerSide : 'w';
 
   const displayWhiteName =
-    mode === 'online' ? roomState?.players.w?.name || t(settings.language, 'whiteKingdom') : whiteName;
+    mode === 'online'
+      ? roomState?.players.w?.name || t(settings.language, 'whiteKingdom')
+      : mode === 'local' && SETUP_V2
+        ? t(settings.language, 'sideWhite')
+        : whiteName;
   const displayBlackName =
-    mode === 'online' ? roomState?.players.b?.name || t(settings.language, 'blackKingdom') : blackName;
+    mode === 'online'
+      ? roomState?.players.b?.name || t(settings.language, 'blackKingdom')
+      : mode === 'local' && SETUP_V2
+        ? t(settings.language, 'sideBlack')
+        : blackName;
+
+  const handleAutoDowngradeCombatPace = useCallback(() => {
+    setSettings((s) => (s.combatPace === 'full' ? { ...s, combatPace: 'fast' } : s));
+  }, []);
 
   return (
     <ErrorBoundary>
-      <div className="relative w-screen h-screen overflow-hidden bg-[#0D1017] select-none">
+      <div
+        className={`relative overflow-hidden bg-[#0D1017] select-none ${
+          UX_POLISH ? 'w-full h-[100dvh] overscroll-none' : 'w-screen h-screen'
+        }`}
+      >
         {/* Full-Viewport 3D Medieval Chess Battlefield */}
         <ChessArena3D
           lang={settings.language}
@@ -828,10 +1088,11 @@ export default function App() {
           interactive={mode !== 'menu'}
           onSquareClick={handleSquareClick}
           onCombatStateChange={setCombatActive}
+          onAutoDowngradeCombatPace={handleAutoDowngradeCombatPace}
         />
 
         {/* Home Menu Overlay */}
-        {mode === 'menu' && (
+        {mode === 'menu' && !firstLoadBlocking && (
           <MainMenu
             settings={settings}
             user={user}
@@ -864,13 +1125,20 @@ export default function App() {
             blackName={displayBlackName}
             whiteClockMs={whiteClockMs}
             blackClockMs={blackClockMs}
-            untimed={mode === 'online' ? (roomState?.timeControl.initialMs ?? 0) === 0 : timeControl.initialMs === 0}
+            untimed={
+              mode === 'online'
+                ? (roomState?.timeControl.initialMs ?? 0) === 0
+                : SETUP_V2
+                  ? turnMinutes === 0
+                  : timeControl.initialMs === 0
+            }
             history={history}
             capturedByWhite={capturedByWhite}
             capturedByBlack={capturedByBlack}
             gameOver={gameOver}
             paused={paused}
             promotionPending={Boolean(pendingPromotion)}
+            serverReconnecting={socketReconnecting}
             onlineStatus={
               mode === 'online' && roomState && onlineColor
                 ? {
@@ -940,6 +1208,7 @@ export default function App() {
                   wName: whiteName,
                   bName: blackName,
                   tc: timeControl,
+                  turnMinutes,
                 });
               }
             }}
@@ -977,8 +1246,12 @@ export default function App() {
             lang={settings.language}
             defaultPlayerName={profile?.displayName || user?.displayName || ''}
             onClose={() => setSetupModal('none')}
-            onStartAI={({ side, difficulty, timeControl: tc }) => {
-              const humanName = profile?.displayName || user?.displayName || t(settings.language, 'whiteKingdom');
+            onStartAI={({ side, difficulty, timeControl: tc, turnMinutes: tm }) => {
+              const factionLabel = side === 'w' ? t(settings.language, 'sideWhite') : t(settings.language, 'sideBlack');
+              const humanName =
+                profile?.displayName ||
+                user?.displayName ||
+                (SETUP_V2 ? factionLabel : t(settings.language, 'whiteKingdom'));
               const botName = `AI (${t(settings.language, difficulty)})`;
               startNewLocalOrAI({
                 targetMode: 'ai',
@@ -987,15 +1260,17 @@ export default function App() {
                 wName: side === 'w' ? humanName : botName,
                 bName: side === 'b' ? humanName : botName,
                 tc,
+                turnMinutes: tm,
               });
             }}
-            onStartLocal={({ whiteName: wN, blackName: bN, timeControl: tc }) => {
+            onStartLocal={({ whiteName: wN, blackName: bN, timeControl: tc, turnMinutes: tm }) => {
               startNewLocalOrAI({
                 targetMode: 'local',
                 side: 'w',
                 wName: wN,
                 bName: bN,
                 tc,
+                turnMinutes: tm,
               });
             }}
           />
@@ -1004,7 +1279,7 @@ export default function App() {
         {setupModal === 'online' && (
           <OnlineLobby
             lang={settings.language}
-            defaultPlayerName={profile?.displayName || user?.displayName || 'Commander'}
+            defaultPlayerName={profile?.displayName || user?.displayName || t(settings.language, 'defaultPlayerName')}
             initialJoinCode={initialRoomCode}
             roomState={roomState}
             myColor={onlineColor}
@@ -1036,6 +1311,7 @@ export default function App() {
 
         {showGallery && (
           <PieceGallery3D
+            lang={settings.language}
             onClose={() => {
               setShowGallery(false);
               if (typeof window !== 'undefined') {

@@ -2,6 +2,7 @@ import React from 'react';
 import { ArrowRight, RotateCcw, Home, CheckCircle2 } from 'lucide-react';
 import { Language } from '../types/chess';
 import { LEARN_LESSONS, LessonSpec, t, TranslationKey } from '../i18n/translations';
+import { UX_POLISH } from '../config/featureFlags';
 
 interface LearnChessHUDProps {
   lang: Language;
@@ -24,7 +25,11 @@ export const LearnChessHUD: React.FC<LearnChessHUDProps> = ({
 
   return (
     <>
-      <div className="fixed top-4 left-4 right-4 z-20 pointer-events-none flex justify-center">
+      <div
+        className={`fixed left-4 right-4 z-20 pointer-events-none flex justify-center ${
+          UX_POLISH ? 'top-[max(0.75rem,env(safe-area-inset-top))]' : 'top-4'
+        }`}
+      >
         <div className="pointer-events-auto max-w-2xl w-full rounded-2xl bg-[#121620]/95 border border-[#D4AF37]/30 p-4 shadow-2xl space-y-2">
           <div className="flex items-center justify-between gap-2">
             <h2 className="font-display text-base sm:text-lg font-bold text-[#D4AF37]">
@@ -50,7 +55,11 @@ export const LearnChessHUD: React.FC<LearnChessHUDProps> = ({
         </div>
       </div>
 
-      <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-20 max-w-[95vw]">
+      <div
+        className={`fixed left-1/2 -translate-x-1/2 z-20 max-w-[95vw] ${
+          UX_POLISH ? 'bottom-[max(0.75rem,env(safe-area-inset-bottom))]' : 'bottom-4'
+        }`}
+      >
         <div className="flex flex-wrap items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-[#121620]/95 border border-[#D4AF37]/25 shadow-2xl">
           <div className="flex items-center gap-1">
             {LEARN_LESSONS.map((l, idx) => (

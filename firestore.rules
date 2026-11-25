@@ -108,6 +108,32 @@ service cloud.firestore {
         && data.createdAt is timestamp;
     }
 
+    function isValidRoomCode(code) {
+      return code is string && code.size() == 6 && code.matches('^[A-Z0-9]{6}$');
+    }
+
+    function isValidOnlineRoomConfig(data) {
+      return data.keys().hasAll([
+          'roomCode', 'hostUid', 'hostSideChoice', 'hostColor',
+          'guestColor', 'turnMinutes', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'roomCode', 'hostUid', 'hostSideChoice', 'hostColor',
+          'guestColor', 'turnMinutes', 'status', 'createdAt', 'updatedAt'
+        ])
+        && isValidRoomCode(data.roomCode)
+        && isValidId(data.hostUid)
+        && data.hostUid == request.auth.uid
+        && data.hostSideChoice in ['w', 'b', 'random']
+        && data.hostColor in ['w', 'b']
+        && data.guestColor in ['w', 'b']
+        && data.hostColor != data.guestColor
+        && data.turnMinutes is int && data.turnMinutes >= 0 && data.turnMinutes <= 180
+        && data.status in ['waiting', 'playing', 'finished']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     match /leaderboard/{userId} {
       allow get: if isValidId(userId);
       allow list: if resource.data.elo is int && resource.data.gamesPlayed is int;
@@ -198,6 +224,42 @@ service cloud.firestore {
         && incoming().createdAt == request.time;
 
       allow update, delete: if false;
+    }
+
+    match /rooms/{roomCode} {
+      allow get: if isSignedIn() && isValidId(roomCode) && isValidRoomCode(roomCode);
+      allow list: if false;
+
+      allow create: if isVerifiedUser()
+        && isValidId(roomCode)
+        && isValidRoomCode(roomCode)
+        && isValidOnlineRoomConfig(incoming())
+        && incoming().roomCode == roomCode
+        && incoming().status == 'waiting'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(roomCode)
+        && isValidRoomCode(roomCode)
+        && isValidOnlineRoomConfig(incoming())
+        && existing().hostUid == request.auth.uid
+        && existing().status != 'finished'
+        && incoming().roomCode == existing().roomCode
+        && incoming().hostUid == existing().hostUid
+        && incoming().hostSideChoice == existing().hostSideChoice
+        && incoming().hostColor == existing().hostColor
+        && incoming().guestColor == existing().guestColor
+        && incoming().turnMinutes == existing().turnMinutes
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+        && (
+          (existing().status == 'waiting' && incoming().status in ['playing', 'finished']) ||
+          (existing().status == 'playing' && incoming().status == 'finished')
+        );
+
+      allow delete: if false;
     }
   }
 }
