@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { X, Volume2, VolumeX, Upload, RotateCcw, Box, Eye } from 'lucide-react';
 import { CombatPace, GameSettings, GraphicsQuality, Language } from '../types/chess';
 import { t } from '../i18n/translations';
-import { SETUP_V2, UX_POLISH } from '../config/featureFlags';
+import { LOCK_GLB_SETTINGS, SETUP_V2, UX_POLISH } from '../config/featureFlags';
 import {
   ALL_GLB_KEYS,
   GlbLoadProgressSnapshot,
@@ -198,28 +198,32 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, onUpdate
             </span>
           </div>
 
-          <form
-            className="flex items-center gap-1.5"
-            onSubmit={(e) => {
-              e.preventDefault();
-              setGlbBaseUrl(baseUrlInput);
-              void preloadGlbTemplates(true);
-            }}
-          >
-            <input
-              type="url"
-              value={baseUrlInput}
-              onChange={(e) => setBaseUrlInput(e.target.value)}
-              placeholder={t(lang, 'glbUrlPlaceholder')}
-              className="flex-1 rounded-lg bg-[#121620] border border-white/15 px-2.5 py-1.5 text-xs text-[#F3EFE6] placeholder:text-[#9AA3B2]/50 focus:outline-none focus:border-[#D4AF37]"
-            />
-            <button
-              type="submit"
-              className="px-2.5 py-1.5 rounded-lg bg-[#D4AF37]/20 hover:bg-[#D4AF37]/30 border border-[#D4AF37]/50 text-[11px] font-semibold text-[#FFD700] shrink-0"
+          {LOCK_GLB_SETTINGS ? (
+            <p className="text-[11px] text-[#9AA3B2] leading-snug">{t(lang, 'glbLockedHint')}</p>
+          ) : (
+            <form
+              className="flex items-center gap-1.5"
+              onSubmit={(e) => {
+                e.preventDefault();
+                setGlbBaseUrl(baseUrlInput);
+                void preloadGlbTemplates(true);
+              }}
             >
-              {t(lang, 'loadUrlBtn')}
-            </button>
-          </form>
+              <input
+                type="url"
+                value={baseUrlInput}
+                onChange={(e) => setBaseUrlInput(e.target.value)}
+                placeholder={t(lang, 'glbUrlPlaceholder')}
+                className="flex-1 rounded-lg bg-[#121620] border border-white/15 px-2.5 py-1.5 text-xs text-[#F3EFE6] placeholder:text-[#9AA3B2]/50 focus:outline-none focus:border-[#D4AF37]"
+              />
+              <button
+                type="submit"
+                className="px-2.5 py-1.5 rounded-lg bg-[#D4AF37]/20 hover:bg-[#D4AF37]/30 border border-[#D4AF37]/50 text-[11px] font-semibold text-[#FFD700] shrink-0"
+              >
+                {t(lang, 'loadUrlBtn')}
+              </button>
+            </form>
+          )}
 
           <div className="space-y-1.5 max-h-60 overflow-y-auto custom-scrollbar pr-1">
             {ALL_GLB_KEYS.map((key) => {
@@ -258,28 +262,30 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, onUpdate
                       )}
                     </div>
                   </div>
-                  <div className="flex items-center gap-1.5 shrink-0">
-                    {st?.source === 'upload' && (
-                      <button
-                        type="button"
-                        onClick={() => clearCustomGlbModel(key)}
-                        title={t(lang, 'glbClearBtn')}
-                        className="p-1.5 rounded-md bg-white/5 hover:bg-white/10 text-[#9AA3B2] hover:text-white"
-                      >
-                        <RotateCcw className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                    <label className="cursor-pointer px-2.5 py-1 rounded-md bg-[#D4AF37]/15 hover:bg-[#D4AF37]/25 border border-[#D4AF37]/40 text-[11px] font-semibold text-[#FFD700] flex items-center gap-1">
-                      <Upload className="w-3 h-3" />
-                      <span>{t(lang, 'glbUploadBtn')}</span>
-                      <input
-                        type="file"
-                        accept=".glb,.gltf"
-                        className="hidden"
-                        onChange={(e) => void handleGlbFile(key, e)}
-                      />
-                    </label>
-                  </div>
+                  {!LOCK_GLB_SETTINGS && (
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {st?.source === 'upload' && (
+                        <button
+                          type="button"
+                          onClick={() => clearCustomGlbModel(key)}
+                          title={t(lang, 'glbClearBtn')}
+                          className="p-1.5 rounded-md bg-white/5 hover:bg-white/10 text-[#9AA3B2] hover:text-white"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                      <label className="cursor-pointer px-2.5 py-1 rounded-md bg-[#D4AF37]/15 hover:bg-[#D4AF37]/25 border border-[#D4AF37]/40 text-[11px] font-semibold text-[#FFD700] flex items-center gap-1">
+                        <Upload className="w-3 h-3" />
+                        <span>{t(lang, 'glbUploadBtn')}</span>
+                        <input
+                          type="file"
+                          accept=".glb,.gltf"
+                          className="hidden"
+                          onChange={(e) => void handleGlbFile(key, e)}
+                        />
+                      </label>
+                    </div>
+                  )}
                 </div>
               );
             })}

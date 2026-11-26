@@ -47,6 +47,7 @@ export const MainMenu: React.FC<MainMenuProps> = ({
   const lang = settings.language;
   const { isInstallable, isInstalled, isIOS, install } = usePWAInstall();
   const [showIOSGuide, setShowIOSGuide] = useState(false);
+  const [logoError, setLogoError] = useState(false);
 
   return (
     <div
@@ -139,12 +140,29 @@ export const MainMenu: React.FC<MainMenuProps> = ({
       {/* Center Hero Title + Kingdom Faceoff Spacer */}
       <div className="flex flex-col items-center text-center my-auto py-4">
         <div className="pointer-events-auto inline-flex flex-col items-center px-6 py-4 rounded-2xl bg-[#0D1017]/82 border border-[#D4AF37]/25 shadow-2xl">
+          <div className="mb-2.5">
+            {!logoError ? (
+              <div className="w-16 h-16 sm:w-20 sm:h-20 p-0.5 bg-[#D4AF37]/40 [clip-path:polygon(19%_0%,81%_0%,100%_19%,100%_81%,81%_100%,19%_100%,0%_81%,0%_19%)] shadow-xl">
+                <img
+                  src="/assets/aistudio/avtGame_ff508b5a.jpg"
+                  alt={t(lang, 'appName')}
+                  referrerPolicy="no-referrer"
+                  onError={() => setLogoError(true)}
+                  className="w-full h-full object-cover [clip-path:polygon(19%_0%,81%_0%,100%_19%,100%_81%,81%_100%,19%_100%,0%_81%,0%_19%)]"
+                />
+              </div>
+            ) : (
+              <div className="w-16 h-16 sm:w-20 sm:h-20 rounded-xl bg-[#161B26] border border-[#D4AF37]/35 flex items-center justify-center text-[#D4AF37]">
+                <Crown className="w-8 h-8" />
+              </div>
+            )}
+          </div>
           <div className="flex items-center gap-3 text-[#D4AF37] mb-1">
-            <Crown className="w-5 h-5" />
+            <Crown className="w-4 h-4 sm:w-5 sm:h-5" />
             <span className="text-xs font-semibold tracking-[0.22em] text-[#9AA3B2]">
               {t(lang, 'whiteKingdom')} · {t(lang, 'blackKingdom')}
             </span>
-            <Crown className="w-5 h-5" />
+            <Crown className="w-4 h-4 sm:w-5 sm:h-5" />
           </div>
           <h1 className="font-display text-3xl sm:text-5xl md:text-6xl font-bold tracking-wider text-[#F3EFE6]">
             {t(lang, 'appName')}

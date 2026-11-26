@@ -5,7 +5,6 @@ import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 import { Server } from 'socket.io';
 import { Chess } from 'chess.js';
-import { createServer as createViteServer } from 'vite';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -767,6 +766,7 @@ export function injectQuery(url) { return url; }
 export class ErrorOverlay { constructor() {} }
 `);
     });
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -784,10 +784,18 @@ export class ErrorOverlay { constructor() {} }
     });
   }
 
-  const PORT = 3000;
+  const parsedPort = Number(process.env.PORT);
+  const PORT = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : 3000;
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`3D CHESS BATTLE server running on http://0.0.0.0:${PORT}`);
   });
+
+  const shutdown = () => {
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 3000).unref();
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
 }
 
 startServer();

@@ -140,6 +140,7 @@ export default function App() {
   const [blackName, setBlackName] = useState(() => t(getDefaultSettings().language, 'blackKingdom'));
   const [timeControl, setTimeControl] = useState<TimeControl>(TIME_CONTROLS[2]);
   const [turnMinutes, setTurnMinutes] = useState<number>(0);
+  const [turnSeconds, setTurnSeconds] = useState<number>(0);
   const [whiteClockMs, setWhiteClockMs] = useState(10 * 60 * 1000);
   const [blackClockMs, setBlackClockMs] = useState(10 * 60 * 1000);
   const [paused, setPaused] = useState(false);
@@ -468,7 +469,8 @@ export default function App() {
   // Active Clock Ticker (Timestamp-driven under UX_POLISH, legacy 250ms under rollback)
   useEffect(() => {
     if (mode !== 'local' && mode !== 'ai' && mode !== 'online') return;
-    const isUntimedLocal = SETUP_V2 ? turnMinutes === 0 : timeControl.initialMs <= 0;
+    const effectiveTurnMs = turnSeconds > 0 ? turnSeconds * 1000 : turnMinutes * 60 * 1000;
+    const isUntimedLocal = SETUP_V2 ? effectiveTurnMs <= 0 : timeControl.initialMs <= 0;
     if (isUntimedLocal && mode !== 'online') return;
     if (mode === 'online' && (!roomState || roomState.timeControl.initialMs <= 0 || roomState.status !== 'playing')) return;
     if (paused || gameOver || combatActive) return;
@@ -556,7 +558,7 @@ export default function App() {
     }, 250);
 
     return () => clearInterval(interval);
-  }, [mode, fen, paused, gameOver, combatActive, timeControl.initialMs, turnMinutes, roomState, history.length]);
+  }, [mode, fen, paused, gameOver, combatActive, timeControl.initialMs, turnMinutes, turnSeconds, roomState, history.length]);
 
   const checkLocalGameEnd = useCallback(
     (chess: Chess, movesCount: number): GameOverInfo | null => {
@@ -634,8 +636,8 @@ export default function App() {
           pausedRemainingMsRef.current = null;
           setGameOver(ended);
         } else if (SETUP_V2) {
-          if (turnMinutes > 0) {
-            const turnMs = turnMinutes * 60 * 1000;
+          const turnMs = turnSeconds > 0 ? turnSeconds * 1000 : turnMinutes * 60 * 1000;
+          if (turnMs > 0) {
             setWhiteClockMs(turnMs);
             setBlackClockMs(turnMs);
             if (result.captured && UX_POLISH) {
@@ -674,7 +676,7 @@ export default function App() {
         return false;
       }
     },
-    [checkLocalGameEnd, history, lessonIndex, mode, timeControl, turnMinutes]
+    [checkLocalGameEnd, history, lessonIndex, mode, timeControl, turnMinutes, turnSeconds]
   );
 
   // Trigger AI move when it's AI's turn
@@ -847,6 +849,7 @@ export default function App() {
     bName: string;
     tc: TimeControl;
     turnMinutes?: number;
+    turnSeconds?: number;
   }) => {
     chessRef.current = new Chess();
     setFen(chessRef.current.fen());
@@ -862,15 +865,17 @@ export default function App() {
     matchStartRef.current = Date.now();
 
     const nextTurnMinutes = opts.turnMinutes ?? 0;
+    const nextTurnSeconds = opts.turnSeconds ?? nextTurnMinutes * 60;
     setPlayerSide(opts.side);
     if (opts.difficulty) setAiDifficulty(opts.difficulty);
     setWhiteName(opts.wName);
     setBlackName(opts.bName);
     setTimeControl(opts.tc);
     setTurnMinutes(nextTurnMinutes);
+    setTurnSeconds(nextTurnSeconds);
 
     if (SETUP_V2) {
-      const turnMs = nextTurnMinutes * 60 * 1000;
+      const turnMs = nextTurnSeconds * 1000;
       setWhiteClockMs(turnMs);
       setBlackClockMs(turnMs);
       turnDeadlineAtRef.current = turnMs > 0 ? Date.now() + turnMs : null;
@@ -921,8 +926,8 @@ export default function App() {
     const prevLast = nextHistory[nextHistory.length - 1];
     setLastMove(prevLast ? { from: prevLast.from, to: prevLast.to } : null);
     setLatestMoveEvent(null);
-    if (SETUP_V2 && turnMinutes > 0) {
-      const turnMs = turnMinutes * 60 * 1000;
+    const turnMs = turnSeconds > 0 ? turnSeconds * 1000 : turnMinutes * 60 * 1000;
+    if (SETUP_V2 && turnMs > 0) {
       setWhiteClockMs(turnMs);
       setBlackClockMs(turnMs);
       turnDeadlineAtRef.current = Date.now() + turnMs;
@@ -1129,7 +1134,7 @@ export default function App() {
               mode === 'online'
                 ? (roomState?.timeControl.initialMs ?? 0) === 0
                 : SETUP_V2
-                  ? turnMinutes === 0
+                  ? (turnSeconds > 0 ? turnSeconds * 1000 : turnMinutes * 60 * 1000) === 0
                   : timeControl.initialMs === 0
             }
             history={history}
@@ -1209,6 +1214,7 @@ export default function App() {
                   bName: blackName,
                   tc: timeControl,
                   turnMinutes,
+                  turnSeconds,
                 });
               }
             }}
@@ -1246,7 +1252,7 @@ export default function App() {
             lang={settings.language}
             defaultPlayerName={profile?.displayName || user?.displayName || ''}
             onClose={() => setSetupModal('none')}
-            onStartAI={({ side, difficulty, timeControl: tc, turnMinutes: tm }) => {
+            onStartAI={({ side, difficulty, timeControl: tc, turnMinutes: tm, turnSeconds: ts }) => {
               const factionLabel = side === 'w' ? t(settings.language, 'sideWhite') : t(settings.language, 'sideBlack');
               const humanName =
                 profile?.displayName ||
@@ -1261,9 +1267,10 @@ export default function App() {
                 bName: side === 'b' ? humanName : botName,
                 tc,
                 turnMinutes: tm,
+                turnSeconds: ts,
               });
             }}
-            onStartLocal={({ whiteName: wN, blackName: bN, timeControl: tc, turnMinutes: tm }) => {
+            onStartLocal={({ whiteName: wN, blackName: bN, timeControl: tc, turnMinutes: tm, turnSeconds: ts }) => {
               startNewLocalOrAI({
                 targetMode: 'local',
                 side: 'w',
@@ -1271,6 +1278,7 @@ export default function App() {
                 bName: bN,
                 tc,
                 turnMinutes: tm,
+                turnSeconds: ts,
               });
             }}
           />

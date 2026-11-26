@@ -460,6 +460,10 @@ interface StoredIdbGlbRecord {
   baseUrl: string;
   version: string;
   byteSize: number;
+  etag?: string | null;
+  lastModified?: string | null;
+  contentLength?: number | null;
+  sourceUrl?: string | null;
   buffer: ArrayBuffer;
   savedAt: number;
 }
@@ -517,7 +521,19 @@ async function readGlbFromIdb(key: GlbPieceKey, baseUrl: string): Promise<Stored
   });
 }
 
-async function writeGlbToIdb(key: GlbPieceKey, baseUrl: string, buffer: ArrayBuffer): Promise<void> {
+interface RemoteGlbHeaders {
+  etag?: string | null;
+  lastModified?: string | null;
+  contentLength?: number | null;
+  sourceUrl?: string | null;
+}
+
+async function writeGlbToIdb(
+  key: GlbPieceKey,
+  baseUrl: string,
+  buffer: ArrayBuffer,
+  headers?: RemoteGlbHeaders
+): Promise<void> {
   const db = await openGlbIdb();
   if (!db) return;
   return new Promise((resolve) => {
@@ -530,6 +546,10 @@ async function writeGlbToIdb(key: GlbPieceKey, baseUrl: string, buffer: ArrayBuf
         baseUrl,
         version: GLB_MANIFEST_VERSION,
         byteSize: buffer.byteLength,
+        etag: headers?.etag ?? null,
+        lastModified: headers?.lastModified ?? null,
+        contentLength: headers?.contentLength ?? buffer.byteLength,
+        sourceUrl: headers?.sourceUrl ?? null,
         buffer: buffer.slice(0),
         savedAt: Date.now(),
       };
@@ -886,16 +906,24 @@ async function fetchWithProgress(
   url: string,
   key: GlbPieceKey,
   filename: string
-): Promise<{ buffer: ArrayBuffer }> {
+): Promise<{
+  buffer: ArrayBuffer;
+  etag: string | null;
+  lastModified: string | null;
+  contentLength: number | null;
+}> {
   const res = await fetch(url, { cache: 'default' });
   const ctype = res.headers.get('content-type') || '';
   if (!res.ok || ctype.includes('text/html')) {
     throw new Error(`HTTP ${res.status} — Không tìm thấy ${filename}`);
   }
 
-  const contentLength = Number(res.headers.get('content-length') || '0');
-  if (contentLength > 0) {
-    slotBytesProgress[key].total = contentLength;
+  const etag = res.headers.get('etag');
+  const lastModified = res.headers.get('last-modified');
+  const contentLengthHeader = Number(res.headers.get('content-length') || '0');
+  const contentLength = contentLengthHeader > 0 ? contentLengthHeader : null;
+  if (contentLengthHeader > 0) {
+    slotBytesProgress[key].total = contentLengthHeader;
   }
 
   if (!res.body) {
@@ -903,7 +931,7 @@ async function fetchWithProgress(
     slotBytesProgress[key].loaded = buf.byteLength;
     slotBytesProgress[key].total = Math.max(slotBytesProgress[key].total, buf.byteLength);
     emitProgress();
-    return { buffer: buf };
+    return { buffer: buf, etag, lastModified, contentLength: contentLength ?? buf.byteLength };
   }
 
   const reader = res.body.getReader();
@@ -930,7 +958,98 @@ async function fetchWithProgress(
     combined.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return { buffer: combined.buffer };
+  return {
+    buffer: combined.buffer,
+    etag,
+    lastModified,
+    contentLength: contentLength ?? combined.byteLength,
+  };
+}
+
+let hasCheckedSourceUpdates = false;
+async function checkForGlbSourceUpdates(baseUrl: string, loader: GLTFLoader): Promise<void> {
+  if (!BUNDLED_MODELS || hasCheckedSourceUpdates) return;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+  hasCheckedSourceUpdates = true;
+
+  for (const key of ALL_GLB_KEYS) {
+    if (loadedTemplates[key]?.source === 'upload') continue;
+    const cfg = PIECE_CONFIG[key];
+    // Bundled Vite assets already carry content-hashed filenames, so skip HEAD checks for bundled slots
+    if (bundledGlbByFilename[cfg.filename.toLowerCase()]) continue;
+
+    const cachedRec = await readGlbFromIdb(key, baseUrl);
+    if (!cachedRec) continue;
+
+    const targetUrl = cachedRec.sourceUrl || resolveCandidateUrls(cfg).find((c) => c.source !== 'bundled')?.url;
+    if (!targetUrl) continue;
+
+    try {
+      const headRes = await fetch(targetUrl, { method: 'HEAD', cache: 'no-cache' });
+      if (!headRes.ok) continue;
+      const remoteEtag = headRes.headers.get('etag');
+      const remoteLastMod = headRes.headers.get('last-modified');
+      const remoteLenNum = Number(headRes.headers.get('content-length') || '0');
+      const remoteLen = remoteLenNum > 0 ? remoteLenNum : null;
+
+      const etagChanged = Boolean(cachedRec.etag && remoteEtag && cachedRec.etag !== remoteEtag);
+      const lastModChanged = Boolean(
+        cachedRec.lastModified && remoteLastMod && cachedRec.lastModified !== remoteLastMod
+      );
+      const lenChanged = Boolean(remoteLen && cachedRec.byteSize && remoteLen !== cachedRec.byteSize);
+
+      if (!etagChanged && !lastModChanged && !lenChanged) {
+        // Backfill missing signature headers cleanly without re-downloading binary
+        if ((!cachedRec.etag && remoteEtag) || (!cachedRec.lastModified && remoteLastMod)) {
+          await writeGlbToIdb(key, baseUrl, cachedRec.buffer, {
+            etag: remoteEtag ?? cachedRec.etag,
+            lastModified: remoteLastMod ?? cachedRec.lastModified,
+            contentLength: remoteLen ?? cachedRec.byteSize,
+            sourceUrl: targetUrl,
+          });
+        }
+        continue;
+      }
+
+      // Remote source genuinely updated -> download updated binary silently
+      const { buffer, etag, lastModified, contentLength } = await fetchWithProgress(targetUrl, key, cfg.filename);
+      const validationErr = verifyGlbBuffer(buffer, cfg.filename);
+      if (validationErr) continue;
+
+      const resourceDir = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+      const gltf = await loader.parseAsync(buffer.slice(0), resourceDir);
+      const tpl = inspectAndPrepareGltf(key, gltf, 'bundled', buffer.byteLength);
+      loadedTemplates[key] = tpl;
+
+      await writeGlbToIdb(key, baseUrl, buffer, {
+        etag: etag ?? remoteEtag,
+        lastModified: lastModified ?? remoteLastMod,
+        contentLength: contentLength ?? buffer.byteLength,
+        sourceUrl: targetUrl,
+      });
+
+      const normSize = computeNormalizedBoxSize(tpl.rawSize, cfg);
+      slotStates[key] = {
+        key,
+        filename: cfg.filename,
+        status: 'loaded',
+        triangles: tpl.triangleCount,
+        meshCount: tpl.meshCount,
+        hasTextures: tpl.hasTextures,
+        hasBuiltInBase: tpl.hasBuiltInBase,
+        rawSize: [+tpl.rawSize.x.toFixed(3), +tpl.rawSize.y.toFixed(3), +tpl.rawSize.z.toFixed(3)],
+        normalizedSize: [+normSize.x.toFixed(3), +normSize.y.toFixed(3), +normSize.z.toFixed(3)],
+        source: 'bundled',
+      };
+      slotBytesProgress[key] = { loaded: buffer.byteLength, total: buffer.byteLength, done: true };
+      emitProgress(true);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('glb-models-updated', { detail: { key, count: getLoadedGlbCount() } }));
+      }
+    } catch {
+      // Offline or blocked HEAD -> keep cached model seamlessly
+    }
+  }
 }
 
 export async function preloadGlbTemplates(force = false): Promise<number> {
@@ -986,8 +1105,9 @@ export async function preloadGlbTemplates(force = false): Promise<number> {
 
       // Launch 2+ Cache-First Hydration from persistent IndexedDB (0 network calls)
       if (BUNDLED_MODELS && !force) {
+        const bundledUrl = bundledGlbByFilename[cfg.filename.toLowerCase()];
         const cachedRec = await readGlbFromIdb(key, baseUrl);
-        if (cachedRec && cachedRec.buffer) {
+        if (cachedRec && cachedRec.buffer && (!bundledUrl || cachedRec.sourceUrl === bundledUrl)) {
           const checkErr = verifyGlbBuffer(cachedRec.buffer, cfg.filename);
           if (!checkErr) {
             try {
@@ -1033,7 +1153,11 @@ export async function preloadGlbTemplates(force = false): Promise<number> {
 
       for (const cand of candidates) {
         try {
-          const { buffer } = await fetchWithProgress(cand.url, key, cfg.filename);
+          const { buffer, etag, lastModified, contentLength } = await fetchWithProgress(
+            cand.url,
+            key,
+            cfg.filename
+          );
           const validationErr = verifyGlbBuffer(buffer, cfg.filename);
           if (validationErr) {
             lastErr = validationErr;
@@ -1047,7 +1171,12 @@ export async function preloadGlbTemplates(force = false): Promise<number> {
           debugStoreKeyByKey[key] = key;
 
           if (BUNDLED_MODELS) {
-            await writeGlbToIdb(key, baseUrl, buffer);
+            await writeGlbToIdb(key, baseUrl, buffer, {
+              etag,
+              lastModified,
+              contentLength,
+              sourceUrl: cand.url,
+            });
           }
 
           const normSize = computeNormalizedBoxSize(tpl.rawSize, cfg);
@@ -1113,6 +1242,10 @@ export async function preloadGlbTemplates(force = false): Promise<number> {
     hasFinishedInitialPreload = true;
     if (loadedCount === ALL_GLB_KEYS.length && BUNDLED_MODELS) {
       setWarmManifestHint(baseUrl);
+      if (!force) {
+        // Non-blocking background check: only re-downloads if remote HEAD signature actually changed
+        void checkForGlbSourceUpdates(baseUrl, loader);
+      }
     } else {
       setWarmManifestHint(null);
       if (loadedCount === 0) {

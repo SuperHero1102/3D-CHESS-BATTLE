@@ -2,8 +2,11 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import fs from 'fs';
 import path from 'path';
+import {fileURLToPath} from 'url';
 import {defineConfig} from 'vite';
 import {VitePWA} from 'vite-plugin-pwa';
+
+const configDir = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig(() => {
   return {
@@ -12,7 +15,7 @@ export default defineConfig(() => {
       tailwindcss(),
       VitePWA({
         registerType: 'autoUpdate',
-        includeAssets: ['icon.svg', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png'],
+        includeAssets: ['favicon-64x64.png', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png', 'pwa-maskable-512x512.png'],
         manifest: {
           id: '/',
           name: '3D CHESS BATTLE',
@@ -47,6 +50,7 @@ export default defineConfig(() => {
         workbox: {
           maximumFileSizeToCacheInBytes: 8 * 1024 * 1024,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
+          globIgnores: ['assets/aistudio/**'],
           navigateFallback: '/index.html',
           runtimeCaching: [
             {
@@ -91,18 +95,18 @@ export default defineConfig(() => {
           if (error) {
             return;
           }
-          const distDir = path.resolve(__dirname, 'dist');
-          const srcAssets = path.resolve(__dirname, 'src/assets');
+          const distDir = path.resolve(configDir, 'dist');
+          const srcAssets = path.resolve(configDir, 'src/assets');
           const distAssets = path.resolve(distDir, 'src/assets');
           if (fs.existsSync(distDir) && fs.existsSync(srcAssets)) {
             fs.cpSync(srcAssets, distAssets, {recursive: true, force: true});
           }
-          const rootModels = path.resolve(__dirname, 'models');
+          const rootModels = path.resolve(configDir, 'models');
           const distModels = path.resolve(distDir, 'models');
           if (fs.existsSync(distDir) && fs.existsSync(rootModels)) {
             fs.cpSync(rootModels, distModels, {recursive: true, force: true});
           }
-          const dracoSrc = path.resolve(__dirname, 'node_modules/three/examples/jsm/libs/draco');
+          const dracoSrc = path.resolve(configDir, 'node_modules/three/examples/jsm/libs/draco');
           const distDraco = path.resolve(distDir, 'draco');
           if (fs.existsSync(distDir) && fs.existsSync(dracoSrc)) {
             fs.cpSync(dracoSrc, distDraco, {recursive: true, force: true});
@@ -112,7 +116,7 @@ export default defineConfig(() => {
     ],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        '@': path.resolve(configDir, '.'),
       },
     },
     server: {

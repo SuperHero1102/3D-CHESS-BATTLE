@@ -3,7 +3,7 @@ import { X, Swords, Shield } from 'lucide-react';
 import { AIDifficulty, Language, PieceColor, TIME_CONTROLS, TimeControl } from '../types/chess';
 import { t } from '../i18n/translations';
 import { SETUP_V2, UX_POLISH } from '../config/featureFlags';
-import { TurnTimerInput, sanitizeTurnMinutes } from './TurnTimerInput';
+import { TurnTimerSecondsInput, sanitizeTurnSeconds } from './TurnTimerSecondsInput';
 
 interface MatchSetupModalProps {
   mode: 'ai' | 'local';
@@ -15,12 +15,14 @@ interface MatchSetupModalProps {
     difficulty: AIDifficulty;
     timeControl: TimeControl;
     turnMinutes?: number;
+    turnSeconds?: number;
   }) => void;
   onStartLocal: (opts: {
     whiteName: string;
     blackName: string;
     timeControl: TimeControl;
     turnMinutes?: number;
+    turnSeconds?: number;
   }) => void;
 }
 
@@ -35,7 +37,7 @@ export const MatchSetupModal: React.FC<MatchSetupModalProps> = ({
   const [sideChoice, setSideChoice] = useState<'w' | 'b' | 'random'>('w');
   const [difficulty, setDifficulty] = useState<AIDifficulty>('medium');
   const [timeId, setTimeId] = useState<string>('rapid10');
-  const [turnMinutes, setTurnMinutes] = useState<number>(0);
+  const [turnSeconds, setTurnSeconds] = useState<number>(0);
   const [whiteName, setWhiteName] = useState<string>(defaultPlayerName || t(lang, 'player1Name'));
   const [blackName, setBlackName] = useState<string>(t(lang, 'player2Name'));
 
@@ -43,27 +45,26 @@ export const MatchSetupModal: React.FC<MatchSetupModalProps> = ({
 
   const handleStart = () => {
     if (SETUP_V2) {
-      const sanitized = sanitizeTurnMinutes(turnMinutes).minutes;
+      const sanitizedSec = sanitizeTurnSeconds(turnSeconds).seconds;
       const perTurnTc: TimeControl = {
-        id: sanitized > 0 ? `turn_${sanitized}m` : 'untimed',
-        initialMs: sanitized * 60 * 1000,
+        id: sanitizedSec > 0 ? `turn_${sanitizedSec}s` : 'untimed',
+        initialMs: sanitizedSec * 1000,
         incrementMs: 0,
       };
       if (mode === 'ai') {
-        const resolvedSide: PieceColor =
-          sideChoice === 'random' ? (Math.random() < 0.5 ? 'w' : 'b') : sideChoice;
+        const resolvedSide: PieceColor = sideChoice === 'b' ? 'b' : 'w';
         onStartAI({
           side: resolvedSide,
           difficulty,
           timeControl: perTurnTc,
-          turnMinutes: sanitized,
+          turnSeconds: sanitizedSec,
         });
       } else {
         onStartLocal({
           whiteName: t(lang, 'sideWhite'),
           blackName: t(lang, 'sideBlack'),
           timeControl: perTurnTc,
-          turnMinutes: sanitized,
+          turnSeconds: sanitizedSec,
         });
       }
       return;
@@ -106,19 +107,23 @@ export const MatchSetupModal: React.FC<MatchSetupModalProps> = ({
           </button>
         </div>
 
-        {/* Choose Side: shown in AI mode always, or in Local mode only when SETUP_V2 is false */}
+        {/* Choose Side: 2 factions only in AI mode under SETUP_V2 */}
         {(mode === 'ai' || !SETUP_V2) && (
           <div className="space-y-2">
             <label className="text-xs font-semibold text-[#9AA3B2]">{t(lang, 'chooseSide')}</label>
-            <div className="grid grid-cols-3 gap-2">
-              {(['w', 'b', 'random'] as const).map((s) => (
+            <div className={`grid gap-2.5 ${SETUP_V2 && mode === 'ai' ? 'grid-cols-2' : 'grid-cols-3'}`}>
+              {(SETUP_V2 && mode === 'ai' ? (['w', 'b'] as const) : (['w', 'b', 'random'] as const)).map((s) => (
                 <button
                   type="button"
                   key={s}
                   onClick={() => setSideChoice(s)}
-                  className={`py-2.5 px-2.5 rounded-xl text-xs font-semibold border transition-colors min-h-[46px] flex items-center justify-center text-center leading-tight ${
+                  className={`py-2.5 px-3 rounded-xl text-xs font-semibold border transition-colors min-h-[46px] flex items-center justify-center text-center leading-tight ${
                     sideChoice === s
-                      ? 'bg-[#D4AF37]/15 border-[#D4AF37] text-[#F3EFE6]'
+                      ? s === 'w'
+                        ? 'bg-[#EF4444]/15 border-[#EF4444] text-[#F3EFE6]'
+                        : s === 'b'
+                          ? 'bg-[#A855F7]/15 border-[#A855F7] text-[#F3EFE6]'
+                          : 'bg-[#D4AF37]/15 border-[#D4AF37] text-[#F3EFE6]'
                       : 'bg-[#181E2B] border-white/10 text-[#9AA3B2] hover:text-white'
                   }`}
                 >
@@ -154,7 +159,7 @@ export const MatchSetupModal: React.FC<MatchSetupModalProps> = ({
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="p-3.5 rounded-xl bg-[#181E2B] border border-[#EF4444]/35 flex items-center justify-between gap-2">
               <div className="min-w-0">
-                <div className="text-[11px] font-semibold text-[#FCA5A5] uppercase tracking-wider">
+                <div className="text-[11px] font-semibold text-[#FCA5A5] tracking-wider">
                   {t(lang, 'firstMoverBadge')}
                 </div>
                 <div className="text-sm font-bold text-[#F3EFE6] mt-0.5">{t(lang, 'sideWhite')}</div>
@@ -163,7 +168,7 @@ export const MatchSetupModal: React.FC<MatchSetupModalProps> = ({
             </div>
             <div className="p-3.5 rounded-xl bg-[#181E2B] border border-[#A855F7]/35 flex items-center justify-between gap-2">
               <div className="min-w-0">
-                <div className="text-[11px] font-semibold text-[#D8B4FE] uppercase tracking-wider">
+                <div className="text-[11px] font-semibold text-[#D8B4FE] tracking-wider">
                   {t(lang, 'secondMoverBadge')}
                 </div>
                 <div className="text-sm font-bold text-[#F3EFE6] mt-0.5">{t(lang, 'sideBlack')}</div>
@@ -199,10 +204,10 @@ export const MatchSetupModal: React.FC<MatchSetupModalProps> = ({
         {/* Shared Turn Timer (SETUP_V2) or Legacy Preset Time Control */}
         {SETUP_V2 ? (
           <div className="p-4 rounded-xl bg-[#181E2B] border border-white/10">
-            <TurnTimerInput
+            <TurnTimerSecondsInput
               id={`turn-timer-${mode}`}
-              value={turnMinutes}
-              onChange={setTurnMinutes}
+              value={turnSeconds}
+              onChange={setTurnSeconds}
               lang={lang}
             />
           </div>
