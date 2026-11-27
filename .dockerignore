@@ -1,0 +1,11 @@
+node_modules
+dist
+dev-dist
+build
+coverage
+.git
+.aistudio
+*.log
+.DS_Store
+.env*
+!.env.example

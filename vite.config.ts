@@ -143,10 +143,10 @@ export default defineConfig(() => {
           if (fs.existsSync(distDir) && fs.existsSync(rootModels)) {
             fs.cpSync(rootModels, distModels, {recursive: true, force: true});
           }
-          const dracoSrc = path.resolve(configDir, 'node_modules/three/examples/jsm/libs/draco');
-          const distDraco = path.resolve(distDir, 'draco');
-          if (fs.existsSync(distDir) && fs.existsSync(dracoSrc)) {
-            fs.cpSync(dracoSrc, distDraco, {recursive: true, force: true});
+          const dracoGltfSrc = path.resolve(configDir, 'node_modules/three/examples/jsm/libs/draco/gltf');
+          const distDracoGltf = path.resolve(distDir, 'draco/gltf');
+          if (fs.existsSync(distDir) && fs.existsSync(dracoGltfSrc)) {
+            fs.cpSync(dracoGltfSrc, distDracoGltf, {recursive: true, force: true});
           }
         },
       },
@@ -154,6 +154,19 @@ export default defineConfig(() => {
     resolve: {
       alias: {
         '@': path.resolve(configDir, '.'),
+      },
+    },
+    build: {
+      rollupOptions: {
+        output: {
+          manualChunks(id: string) {
+            if (!id.includes('node_modules')) return undefined;
+            if (id.includes('/three/')) return 'vendor-three';
+            if (id.includes('/firebase/') || id.includes('/@firebase/')) return 'vendor-firebase';
+            if (id.includes('/react/') || id.includes('/react-dom/') || id.includes('/motion/')) return 'vendor-ui';
+            return undefined;
+          },
+        },
       },
     },
     server: {
