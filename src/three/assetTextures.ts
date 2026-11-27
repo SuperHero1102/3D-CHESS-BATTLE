@@ -44,17 +44,48 @@ function loadHtmlImage(url: string): Promise<HTMLImageElement> {
   });
 }
 
+export interface ArenaTextureLoadOptions {
+  maxTextureDim?: number;
+  maxBannerDim?: number;
+  disableMipmaps?: boolean;
+}
+
+function getScaledDimensions(naturalW: number, naturalH: number, maxDim?: number): { w: number; h: number } {
+  if (!maxDim || maxDim <= 0) {
+    return { w: naturalW, h: naturalH };
+  }
+  const largest = Math.max(naturalW, naturalH);
+  if (largest <= maxDim) {
+    return { w: naturalW, h: naturalH };
+  }
+  const scale = maxDim / largest;
+  return {
+    w: Math.max(4, Math.round(naturalW * scale)),
+    h: Math.max(4, Math.round(naturalH * scale)),
+  };
+}
+
+function releaseHtmlImage(img: HTMLImageElement): void {
+  img.onload = null;
+  img.onerror = null;
+  try {
+    img.src = '';
+  } catch {
+    // ignore
+  }
+}
+
 /**
- * Copies a loaded asset image to an offscreen canvas and cleans the tiny
- * bottom-right corner generation mark by sampling adjacent clean pixels
+ * Copies a loaded asset image to an offscreen canvas (optionally downscaled for mobile VRAM)
+ * and cleans the tiny bottom-right corner generation mark by sampling adjacent clean pixels
  * from the same texture, preserving 99.8%+ of the original artwork untouched.
  */
 function sanitizeCornerMark(
   img: HTMLImageElement,
-  patchBox?: { xFrac: number; yFrac: number; wFrac: number; hFrac: number; sampleDxFrac: number }
+  patchBox?: { xFrac: number; yFrac: number; wFrac: number; hFrac: number; sampleDxFrac: number },
+  maxDim?: number
 ): HTMLCanvasElement {
-  const w = img.naturalWidth;
-  const h = img.naturalHeight;
+  const { w, h } = getScaledDimensions(img.naturalWidth, img.naturalHeight, maxDim);
   const canvas = document.createElement('canvas');
   canvas.width = w;
   canvas.height = h;
@@ -69,6 +100,19 @@ function sanitizeCornerMark(
     const sx = Math.max(0, Math.min(w - pw, px + Math.floor(w * patchBox.sampleDxFrac)));
     ctx.drawImage(canvas, sx, py, pw, ph, px, py, pw, ph);
   }
+  return canvas;
+}
+
+function resizeBackdropIfNeeded(img: HTMLImageElement, maxDim?: number): HTMLImageElement | HTMLCanvasElement {
+  if (!maxDim || maxDim <= 0) return img;
+  const { w, h } = getScaledDimensions(img.naturalWidth, img.naturalHeight, maxDim);
+  if (w === img.naturalWidth && h === img.naturalHeight) return img;
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(img, 0, 0, w, h);
+  releaseHtmlImage(img);
   return canvas;
 }
 
@@ -121,14 +165,14 @@ function sliceEmblemCell(
   gridImg: HTMLImageElement,
   col: number,
   row: number,
-  color: PieceColor
+  color: PieceColor,
+  outSize = 256
 ): HTMLCanvasElement {
   const gw = gridImg.naturalWidth;
   const gh = gridImg.naturalHeight;
   const cellW = Math.floor(gw / 3);
   const cellH = Math.floor(gh / 2);
 
-  const outSize = 256;
   const canvas = document.createElement('canvas');
   canvas.width = outSize;
   canvas.height = outSize;
@@ -137,16 +181,17 @@ function sliceEmblemCell(
   // Add slight inset so neighboring cell borders never bleed
   const padX = Math.floor(cellW * 0.04);
   const padY = Math.floor(cellH * 0.04);
+  const margin = Math.max(6, Math.round(outSize * 0.055));
   ctx.drawImage(
     gridImg,
     col * cellW + padX,
     row * cellH + padY,
     cellW - padX * 2,
     cellH - padY * 2,
-    14,
-    14,
-    outSize - 28,
-    outSize - 28
+    margin,
+    margin,
+    outSize - margin * 2,
+    outSize - margin * 2
   );
 
   const imgData = ctx.getImageData(0, 0, outSize, outSize);
@@ -197,14 +242,22 @@ function makePlaceholderCanvas(w = 4, h = 4): HTMLCanvasElement {
 
 export function loadArenaAssetTextures(
   maxAnisotropy: number,
-  onFatalError: (err: Error) => void
+  onFatalError: (err: Error) => void,
+  options: ArenaTextureLoadOptions = {}
 ): LoadedArenaTextures {
   const allTextures: THREE.Texture[] = [];
+  const { maxTextureDim, maxBannerDim, disableMipmaps = false } = options;
+  const emblemSize = maxBannerDim && maxBannerDim <= 256 ? 128 : maxTextureDim ? 192 : 256;
+  let isDisposed = false;
 
   const makeLiveTex = (repeat = false): THREE.Texture<TexImageSource> => {
     const tex: THREE.Texture<TexImageSource> = new THREE.Texture(makePlaceholderCanvas() as TexImageSource);
     tex.colorSpace = THREE.SRGBColorSpace;
     tex.anisotropy = maxAnisotropy;
+    if (disableMipmaps) {
+      tex.generateMipmaps = false;
+      tex.minFilter = THREE.LinearFilter;
+    }
     if (repeat) {
       tex.wrapS = THREE.RepeatWrapping;
       tex.wrapT = THREE.RepeatWrapping;
@@ -242,58 +295,94 @@ export function loadArenaAssetTextures(
     loadHtmlImage(ASSET_IMAGE_URLS.emblemsGrid),
   ])
     .then(([backdropImg, lightImg, darkImg, wBannerImg, bBannerImg, scutumImg, gridImg]) => {
+      if (isDisposed) {
+        releaseHtmlImage(backdropImg);
+        releaseHtmlImage(lightImg);
+        releaseHtmlImage(darkImg);
+        releaseHtmlImage(wBannerImg);
+        releaseHtmlImage(bBannerImg);
+        releaseHtmlImage(scutumImg);
+        releaseHtmlImage(gridImg);
+        return;
+      }
+
       // 1. Backdrop
-      backdropTex.image = backdropImg;
+      backdropTex.image = resizeBackdropIfNeeded(backdropImg, maxTextureDim) as TexImageSource;
       backdropTex.needsUpdate = true;
 
       // 2. White Carrara marble (clean bottom-right corner subtle mark)
-      lightMarbleTex.image = sanitizeCornerMark(lightImg, {
-        xFrac: 0.84,
-        yFrac: 0.84,
-        wFrac: 0.08,
-        hFrac: 0.08,
-        sampleDxFrac: -0.1,
-      });
+      lightMarbleTex.image = sanitizeCornerMark(
+        lightImg,
+        {
+          xFrac: 0.84,
+          yFrac: 0.84,
+          wFrac: 0.08,
+          hFrac: 0.08,
+          sampleDxFrac: -0.1,
+        },
+        maxTextureDim
+      );
       lightMarbleTex.needsUpdate = true;
+      releaseHtmlImage(lightImg);
 
       // 3. Dark Obsidian marble (clean bottom-right star mark)
-      darkObsidianTex.image = sanitizeCornerMark(darkImg, {
-        xFrac: 0.83,
-        yFrac: 0.83,
-        wFrac: 0.1,
-        hFrac: 0.1,
-        sampleDxFrac: -0.12,
-      });
+      darkObsidianTex.image = sanitizeCornerMark(
+        darkImg,
+        {
+          xFrac: 0.83,
+          yFrac: 0.83,
+          wFrac: 0.1,
+          hFrac: 0.1,
+          sampleDxFrac: -0.12,
+        },
+        maxTextureDim
+      );
       darkObsidianTex.needsUpdate = true;
+      releaseHtmlImage(darkImg);
 
       // 4. White Crimson Eagle Banner (heal tiny lower-right fabric diamond inside gold border)
-      whiteBannerTex.image = sanitizeCornerMark(wBannerImg, {
-        xFrac: 0.77,
-        yFrac: 0.87,
-        wFrac: 0.08,
-        hFrac: 0.05,
-        sampleDxFrac: -0.1,
-      });
+      whiteBannerTex.image = sanitizeCornerMark(
+        wBannerImg,
+        {
+          xFrac: 0.77,
+          yFrac: 0.87,
+          wFrac: 0.08,
+          hFrac: 0.05,
+          sampleDxFrac: -0.1,
+        },
+        maxBannerDim
+      );
       whiteBannerTex.needsUpdate = true;
+      releaseHtmlImage(wBannerImg);
 
       // 5. Black Royal Purple Eagle Banner
-      blackBannerTex.image = sanitizeCornerMark(bBannerImg, {
-        xFrac: 0.82,
-        yFrac: 0.84,
-        wFrac: 0.08,
-        hFrac: 0.05,
-        sampleDxFrac: -0.1,
-      });
+      blackBannerTex.image = sanitizeCornerMark(
+        bBannerImg,
+        {
+          xFrac: 0.82,
+          yFrac: 0.84,
+          wFrac: 0.08,
+          hFrac: 0.05,
+          sampleDxFrac: -0.1,
+        },
+        maxBannerDim
+      );
       blackBannerTex.needsUpdate = true;
+      releaseHtmlImage(bBannerImg);
 
       // 6. Scutum Shield Face (White Crimson & Black Amethyst-Crimson variants from real Image 6)
-      const cleanScutum = sanitizeCornerMark(scutumImg, {
-        xFrac: 0.81,
-        yFrac: 0.85,
-        wFrac: 0.08,
-        hFrac: 0.06,
-        sampleDxFrac: -0.1,
-      });
+      const cleanScutum = sanitizeCornerMark(
+        scutumImg,
+        {
+          xFrac: 0.81,
+          yFrac: 0.85,
+          wFrac: 0.08,
+          hFrac: 0.06,
+          sampleDxFrac: -0.1,
+        },
+        maxBannerDim
+      );
+      releaseHtmlImage(scutumImg);
       scutumWhiteTex.image = cleanScutum;
       scutumWhiteTex.needsUpdate = true;
 
@@ -304,12 +393,14 @@ export function loadArenaAssetTextures(
       for (const side of ['w', 'b'] as PieceColor[]) {
         for (const cell of GRID_LAYOUT) {
           const tex = emblemTextures[`${side}_${cell.type}`];
-          tex.image = sliceEmblemCell(gridImg, cell.col, cell.row, side);
+          tex.image = sliceEmblemCell(gridImg, cell.col, cell.row, side, emblemSize);
           tex.needsUpdate = true;
         }
       }
+      releaseHtmlImage(gridImg);
     })
     .catch((err) => {
+      if (isDisposed) return;
       const error = err instanceof Error ? err : new Error(String(err));
       console.error('[3D CHESS BATTLE] Critical asset texture load failure:', error);
       onFatalError(error);
@@ -327,7 +418,15 @@ export function loadArenaAssetTextures(
     emblemTextures,
     loadPromise,
     dispose: () => {
+      isDisposed = true;
       for (const tex of allTextures) {
+        const img = tex.image as unknown;
+        if (img && typeof HTMLCanvasElement !== 'undefined' && img instanceof HTMLCanvasElement) {
+          img.width = 0;
+          img.height = 0;
+        } else if (img && typeof HTMLImageElement !== 'undefined' && img instanceof HTMLImageElement) {
+          releaseHtmlImage(img);
+        }
         tex.dispose();
       }
     },

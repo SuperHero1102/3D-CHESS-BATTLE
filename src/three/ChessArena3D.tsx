@@ -48,6 +48,15 @@ import {
 } from './modelLoader';
 import { SETUP_V2, UX_POLISH } from '../config/featureFlags';
 import { t } from '../i18n/translations';
+import {
+  enableSafeModeAndReload,
+  getBootSafeMode,
+  isCoarsePointerDevice,
+  isIOSDevice,
+  markBootStable,
+  markSessionActive,
+  markSessionInactive,
+} from '../utils/deviceProfile';
 
 // 1-LINE ROLLBACK TOGGLE: Set to `true` to immediately restore the legacy renderer
 export const USE_LEGACY_RENDERER = false;
@@ -71,6 +80,7 @@ export interface ChessArenaProps {
   latestMoveEvent: { seq: number; move: MoveRecord } | null;
   skipCombatTrigger: number;
   interactive: boolean;
+  paused?: boolean;
   onSquareClick: (square: string) => void;
   onCombatStateChange?: (active: boolean) => void;
   onAutoDowngradeCombatPace?: () => void;
@@ -113,6 +123,7 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
   latestMoveEvent,
   skipCombatTrigger,
   interactive,
+  paused = false,
   onSquareClick,
   onCombatStateChange,
   onAutoDowngradeCombatPace,
@@ -156,6 +167,8 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
 
   const settingsRef = useRef({ combatPace, interactive, showValidMoves, graphicsQuality, selectedSquare, fen });
   settingsRef.current = { combatPace, interactive, showValidMoves, graphicsQuality, selectedSquare, fen };
+  const pausedRef = useRef<boolean>(paused);
+  pausedRef.current = paused;
 
   const sceneApiRef = useRef<{
     syncBoardFromFen: (targetFen: string) => void;
@@ -173,6 +186,7 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
     setCoordinatesVisible: (visible: boolean) => void;
     skipCombat: () => void;
     rebuildQuality: (quality: GraphicsQuality) => void;
+    setPaused: (paused: boolean) => void;
   } | null>(null);
 
   const lastSeqRef = useRef<number>(0);
@@ -212,9 +226,19 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
       }
     })();
 
-    const isCoarsePointer =
-      typeof window !== 'undefined' && Boolean(window.matchMedia?.('(pointer: coarse)').matches);
-    const maxDpr = UX_POLISH ? (isCoarsePointer ? 1.5 : 2) : 2;
+    const isIOS = isIOSDevice();
+    const isSafeMode = getBootSafeMode();
+    const isCoarsePointer = isCoarsePointerDevice();
+    const isConstrained = isIOS || isCoarsePointer || isSafeMode;
+    const usePostProcessing = !isSoftwareGl && !isIOS && !isSafeMode;
+    const maxDpr = isSafeMode ? 1 : isIOS ? 1.25 : UX_POLISH ? (isCoarsePointer ? 1.35 : 2) : 2;
+    const effectiveArenaQuality: GraphicsQuality = isSafeMode
+      ? 'low'
+      : isIOS && graphicsQuality === 'high'
+        ? 'medium'
+        : graphicsQuality;
+
+    markSessionActive();
 
     if (UX_POLISH) {
       // Ensure GLB preload starts even if WebGL initialization fails (prevents splash deadlock)
@@ -228,8 +252,8 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
     let renderer: THREE.WebGLRenderer;
     try {
       renderer = new THREE.WebGLRenderer({
-        antialias: true,
-        powerPreference: 'high-performance',
+        antialias: !isSafeMode,
+        powerPreference: isConstrained ? 'default' : 'high-performance',
       });
     } catch (err) {
       setAssetError(err instanceof Error ? err.message : 'WebGL initialization failed');
@@ -238,8 +262,10 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 0.9;
-    renderer.setPixelRatio(isSoftwareGl ? 0.65 : Math.min(window.devicePixelRatio || 1, maxDpr));
-    renderer.shadowMap.enabled = !isSoftwareGl && graphicsQuality !== 'low';
+    renderer.setPixelRatio(
+      isSoftwareGl ? 0.65 : Math.min(window.devicePixelRatio || 1, graphicsQuality === 'low' ? Math.min(maxDpr, 1.15) : maxDpr)
+    );
+    renderer.shadowMap.enabled = !isSoftwareGl && !isSafeMode && graphicsQuality !== 'low';
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.setSize(initW, initH);
 
@@ -252,9 +278,14 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
 
     const handleContextLost = (e: Event) => {
       e.preventDefault();
+      cancelScheduled();
       setContextLost(true);
     };
-    const handleContextRestored = () => setContextLost(false);
+    const handleContextRestored = () => {
+      setContextLost(false);
+      lastTickMs = performance.now();
+      scheduleNext();
+    };
     canvas.addEventListener('webglcontextlost', handleContextLost);
     canvas.addEventListener('webglcontextrestored', handleContextRestored);
 
@@ -292,8 +323,8 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
     // 2. Cool Moonlight DirectionalLight (#8fa8ff) casting soft shadows
     const keyLight = new THREE.DirectionalLight(0x8fa8ff, 2.05);
     keyLight.position.set(-7.5, 14.5, -7.5);
-    keyLight.castShadow = !isSoftwareGl && graphicsQuality !== 'low';
-    const shadowSize = graphicsQuality === 'high' ? 2048 : 1024;
+    keyLight.castShadow = !isSoftwareGl && !isSafeMode && graphicsQuality !== 'low';
+    const shadowSize = isConstrained ? 1024 : graphicsQuality === 'high' ? 2048 : 1024;
     keyLight.shadow.mapSize.set(shadowSize, shadowSize);
     keyLight.shadow.camera.left = -6.8;
     keyLight.shadow.camera.right = 6.8;
@@ -314,15 +345,15 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
     rimFront.position.set(-2.5, 4.4, 11.2);
     scene.add(rimFront);
 
-    // Stage 1 Post-Processing: RenderPass -> UnrealBloomPass(0.6, 0.5, 0.85) -> SMAAPass -> Vignette -> OutputPass
+    // Stage 1 Post-Processing (Desktop GPU only; skipped on iOS/SafeMode to stay well inside WebKit VRAM limits)
     let composer: EffectComposer | null = null;
     let bloomPass: UnrealBloomPass | null = null;
     let smaaPass: SMAAPass | null = null;
     let vignettePass: ShaderPass | null = null;
     let composerRT: THREE.WebGLRenderTarget | null = null;
-    let autoDowngraded = false;
+    let autoDowngraded = isSafeMode;
 
-    if (!isSoftwareGl) {
+    if (usePostProcessing) {
       composerRT = new THREE.WebGLRenderTarget(initW, initH, {
         type: THREE.HalfFloatType,
         samples: 2,
@@ -349,16 +380,24 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
     }
 
     const maxAniso = renderer.capabilities.getMaxAnisotropy();
-    const palette: MaterialPalette = createMaterialPalette(maxAniso, isSoftwareGl, (err) => {
-      setAssetError(err.message);
-    });
-    let arena: ArenaHandles = buildMedievalArena(scene, palette, graphicsQuality);
+    const palette: MaterialPalette = createMaterialPalette(
+      maxAniso,
+      isSoftwareGl,
+      (err) => {
+        setAssetError(err.message);
+      },
+      { isConstrainedDevice: isConstrained, isSafeMode }
+    );
+    let arena: ArenaHandles = buildMedievalArena(scene, palette, effectiveArenaQuality);
     arena.coordGroup.visible = showCoordinates;
 
     const combatDirector = new CombatDirector(scene, {
       smokeTex: palette.smokeTex,
       emberTex: palette.emberTex,
     });
+    if (isSafeMode) {
+      combatDirector.lowPerfMode = true;
+    }
     const pieceMap = new Map<string, WarriorRig>();
     const pieceGroup = new THREE.Group();
     scene.add(pieceGroup);
@@ -927,11 +966,13 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
     };
 
     const rebuildQuality = (quality: GraphicsQuality) => {
+      const effQ: GraphicsQuality = isSafeMode ? 'low' : isIOS && quality === 'high' ? 'medium' : quality;
+      const targetMaxDpr = isSafeMode ? 1 : quality === 'low' ? Math.min(maxDpr, 1.15) : maxDpr;
       renderer.setPixelRatio(
-        isSoftwareGl ? 0.65 : Math.min(window.devicePixelRatio || 1, quality === 'low' ? 1.25 : maxDpr)
+        isSoftwareGl ? 0.65 : Math.min(window.devicePixelRatio || 1, targetMaxDpr)
       );
-      renderer.shadowMap.enabled = !isSoftwareGl && quality !== 'low';
-      keyLight.castShadow = !isSoftwareGl && quality !== 'low';
+      renderer.shadowMap.enabled = !isSoftwareGl && !isSafeMode && quality !== 'low';
+      keyLight.castShadow = !isSoftwareGl && !isSafeMode && quality !== 'low';
       if (bloomPass) {
         bloomPass.enabled = quality !== 'low' && !autoDowngraded;
       }
@@ -939,8 +980,18 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
         smaaPass.enabled = quality !== 'low' && !autoDowngraded;
       }
       arena.dispose();
-      arena = buildMedievalArena(scene, palette, quality);
+      arena = buildMedievalArena(scene, palette, effQ);
       arena.coordGroup.visible = showCoordinates;
+    };
+
+    const setPaused = (nextPaused: boolean) => {
+      if (disposed) return;
+      if (nextPaused) {
+        cancelScheduled();
+      } else {
+        lastTickMs = performance.now();
+        scheduleNext();
+      }
     };
 
     sceneApiRef.current = {
@@ -953,6 +1004,7 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
       },
       skipCombat: () => combatDirector.skipActiveCombat(),
       rebuildQuality,
+      setPaused,
     };
 
     const raycaster = new THREE.Raycaster();
@@ -1142,12 +1194,14 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
       resizeObs.observe(container);
     }
 
-    if (!isSoftwareGl) {
+    if (!isSoftwareGl && !isSafeMode) {
       renderer.compile(scene, camera);
     }
 
     let lastTickMs = performance.now();
     let elapsedSec = 0;
+    let stableAccumSec = 0;
+    let bootMarkedStable = false;
     let rafId = 0;
     let timerId = 0;
     let disposed = false;
@@ -1165,7 +1219,7 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
     };
 
     const scheduleNext = () => {
-      if (disposed || document.hidden) return;
+      if (disposed || document.hidden || pausedRef.current) return;
       if (isSoftwareGl) {
         afterDraw(tick);
       } else {
@@ -1177,12 +1231,27 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
       if (disposed) return;
       if (document.hidden) {
         cancelScheduled();
+        markSessionInactive();
       } else {
+        markSessionActive();
         lastTickMs = performance.now();
         scheduleNext();
       }
     };
+    const handlePageHide = () => {
+      if (disposed) return;
+      cancelScheduled();
+      markSessionInactive();
+    };
+    const handlePageShow = () => {
+      if (disposed) return;
+      markSessionActive();
+      lastTickMs = performance.now();
+      scheduleNext();
+    };
     document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', handlePageHide);
+    window.addEventListener('pageshow', handlePageShow);
 
     function afterDraw(cb: () => void) {
       const gl = renderer.getContext() as WebGL2RenderingContext;
@@ -1195,7 +1264,7 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
       const fenceStart = performance.now();
       const poll = () => {
         rafId = 0;
-        if (disposed || document.hidden) {
+        if (disposed || document.hidden || pausedRef.current) {
           gl.deleteSync(sync);
           return;
         }
@@ -1211,13 +1280,21 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
     }
 
     function tick() {
-      if (disposed || document.hidden) return;
+      if (disposed || document.hidden || pausedRef.current) return;
       const nowMs = performance.now();
       const rawDelta = Math.max(0, (nowMs - lastTickMs) / 1000);
       lastTickMs = nowMs;
       const delta = Math.min(rawDelta, isSoftwareGl ? 0.65 : 0.08);
       elapsedSec += delta;
       const elapsed = elapsedSec;
+
+      if (!bootMarkedStable) {
+        stableAccumSec += delta;
+        if (stableAccumSec >= 4.5) {
+          bootMarkedStable = true;
+          markBootStable();
+        }
+      }
 
       // Stage 1: Automatic FPS < 30 for 3s hardware downgrade guard (real WebGL GPU)
       if (!isSoftwareGl && !autoDowngraded && rawDelta > 0 && rawDelta < 0.5) {
@@ -1357,6 +1434,7 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
 
     return () => {
       disposed = true;
+      markSessionInactive();
       cancelScheduled();
       for (const tid of promoTimers) {
         clearTimeout(tid);
@@ -1365,6 +1443,8 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
       if (resizeTimer) window.clearTimeout(resizeTimer);
       resizeObs?.disconnect();
       document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', handlePageHide);
+      window.removeEventListener('pageshow', handlePageShow);
       window.removeEventListener('resize', onResize);
       window.removeEventListener('orientationchange', onOrientationChange);
       visualVp?.removeEventListener('resize', onResize);
@@ -1385,11 +1465,20 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
       envTex.dispose();
       composer?.dispose();
       composerRT?.dispose();
+      selectRing.geometry.dispose();
       selectRingMat.dispose();
+      selectAura.geometry.dispose();
       selectAuraMat.dispose();
+      hoverRing.geometry.dispose();
       hoverRingMat.dispose();
+      checkRing.geometry.dispose();
       checkRingMat.dispose();
+      lastMoveFrom.geometry.dispose();
       lastMoveFromMat.dispose();
+      hintMarkers.forEach((hm) => {
+        hm.geometry.dispose();
+        (hm.material as THREE.Material).dispose();
+      });
       padPlaneGeo.dispose();
       padPlaneMat.dispose();
       padDotGeo.dispose();
@@ -1446,6 +1535,10 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
       sceneApiRef.current?.skipCombat();
     }
   }, [skipCombatTrigger]);
+
+  useEffect(() => {
+    sceneApiRef.current?.setPaused(paused);
+  }, [paused]);
 
   const shownTip = tooltip ?? lastTooltipDataRef.current;
 
@@ -1591,8 +1684,15 @@ const UpgradedChessArena3D: React.FC<ChessArenaProps> = ({
       )}
 
       {contextLost && (
-        <div className="absolute inset-0 flex items-center justify-center bg-[#0D1017]/95 text-[#F3EFE6] p-6 text-center">
-          <p className="text-sm">WebGL context interrupted — restoring 3D battlefield...</p>
+        <div className="absolute inset-0 z-40 flex flex-col items-center justify-center gap-3 bg-[#0D1017]/95 text-[#F3EFE6] p-6 text-center">
+          <p className="text-sm font-medium">{t(lang, 'webglLostTitle')}</p>
+          <button
+            type="button"
+            onClick={enableSafeModeAndReload}
+            className="px-4 py-2 rounded-xl bg-[#D4AF37] hover:bg-[#e5c150] text-[#0D1017] text-xs font-bold shadow-lg"
+          >
+            {t(lang, 'webglSafeReloadBtn')}
+          </button>
         </div>
       )}
 

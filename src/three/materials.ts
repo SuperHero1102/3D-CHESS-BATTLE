@@ -446,19 +446,40 @@ function makeFireSpriteTexture(): THREE.CanvasTexture {
   return tex;
 }
 
+export interface MaterialPaletteDeviceOpts {
+  isConstrainedDevice?: boolean;
+  isSafeMode?: boolean;
+}
+
 export function createMaterialPalette(
   maxAnisotropy: number,
   isSoftwareGl: boolean,
-  onFatalAssetError: (err: Error) => void
+  onFatalAssetError: (err: Error) => void,
+  deviceOpts: MaterialPaletteDeviceOpts = {}
 ): MaterialPalette {
-  const assetTextures = loadArenaAssetTextures(maxAnisotropy, onFatalAssetError);
+  const { isConstrainedDevice = false, isSafeMode = false } = deviceOpts;
+  const effectiveAniso = isSafeMode ? 1 : isConstrainedDevice ? Math.min(maxAnisotropy, 2) : maxAnisotropy;
+  const procMapSize = isSafeMode ? 192 : isConstrainedDevice ? 256 : 512;
+  const smallMapSize = isSafeMode || isConstrainedDevice ? 128 : 256;
 
-  const microNoiseBump = makeMicroNoiseBump();
-  const travertine = makeTravertineBorderMaps();
-  const masonry = makeAshlarMasonryMaps();
-  const fluted = makeFlutedColumnMaps();
-  const courtyard = makeRomanCourtyardMaps();
-  const clothBump = makeClothFoldsBump();
+  const assetTextures = loadArenaAssetTextures(
+    effectiveAniso,
+    onFatalAssetError,
+    isConstrainedDevice || isSafeMode
+      ? {
+          maxTextureDim: isSafeMode ? 512 : 1024,
+          maxBannerDim: isSafeMode ? 256 : 512,
+          disableMipmaps: isSafeMode,
+        }
+      : {}
+  );
+
+  const microNoiseBump = makeMicroNoiseBump(smallMapSize);
+  const travertine = makeTravertineBorderMaps(procMapSize);
+  const masonry = makeAshlarMasonryMaps(procMapSize);
+  const fluted = makeFlutedColumnMaps(procMapSize);
+  const courtyard = makeRomanCourtyardMaps(procMapSize);
+  const clothBump = makeClothFoldsBump(smallMapSize);
   const whiteFaceTex = makeWarriorFaceTexture('#DFB48E');
   const blackFaceTex = makeWarriorFaceTexture('#C79B78');
   const kingWhiteSkinTex = makeSculptedSkinTexture('#DDA984');
@@ -478,7 +499,7 @@ export function createMaterialPalette(
     courtyard.map,
     courtyard.bumpMap,
   ].forEach((t) => {
-    t.anisotropy = maxAnisotropy;
+    t.anisotropy = effectiveAniso;
   });
 
   const extraTextures: THREE.Texture[] = [
@@ -995,7 +1016,14 @@ export function createMaterialPalette(
     getEmblemMaterial,
     dispose: () => {
       assetTextures.dispose();
-      extraTextures.forEach((t) => t.dispose());
+      extraTextures.forEach((t) => {
+        const img = t.image as unknown;
+        if (img && typeof HTMLCanvasElement !== 'undefined' && img instanceof HTMLCanvasElement) {
+          img.width = 0;
+          img.height = 0;
+        }
+        t.dispose();
+      });
       materials.forEach((m) => m.dispose());
       emblemCache.forEach((m) => m.dispose());
       emblemCache.clear();

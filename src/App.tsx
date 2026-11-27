@@ -22,6 +22,7 @@ import { SETUP_V2, UX_POLISH } from './config/featureFlags';
 import { ChessArena3D } from './three/ChessArena3D';
 import { getGlbLoadProgressSnapshot, subscribeGlbProgress } from './three/modelLoader';
 import { PieceGallery3D } from './three/PieceGallery3D';
+import { getBootSafeMode, initBootCrashGuard, isIOSDevice } from './utils/deviceProfile';
 import { MainMenu } from './components/MainMenu';
 import { MatchSetupModal } from './components/MatchSetupModal';
 import { OnlineLobby } from './components/OnlineLobby';
@@ -71,6 +72,7 @@ function safeSessionRemove(key: string): void {
 
 function getDefaultSettings(): GameSettings {
   const isTouch = typeof window !== 'undefined' && window.matchMedia?.('(pointer: coarse)').matches;
+  const isIOS = isIOSDevice();
   try {
     const saved = typeof localStorage !== 'undefined' ? localStorage.getItem(SETTINGS_KEY) : null;
     if (saved) {
@@ -81,7 +83,7 @@ function getDefaultSettings(): GameSettings {
   }
   return {
     language: 'vi',
-    graphicsQuality: isTouch ? 'medium' : 'high',
+    graphicsQuality: isIOS || isTouch ? 'medium' : 'high',
     combatPace: 'full',
     soundEnabled: true,
     soundVolume: 0.65,
@@ -104,6 +106,7 @@ function findKingSquare(chess: Chess, color: PieceColor): string | null {
 }
 
 export default function App() {
+  const [iosSafeMode] = useState<boolean>(() => initBootCrashGuard());
   const [settings, setSettings] = useState<GameSettings>(getDefaultSettings);
   const [mode, setMode] = useState<GameMode>('menu');
   const [setupModal, setSetupModal] = useState<'none' | 'ai' | 'local' | 'online'>('none');
@@ -1082,15 +1085,16 @@ export default function App() {
           lastMove={lastMove}
           checkSquare={checkSquare}
           hintMove={hintMove}
-          graphicsQuality={settings.graphicsQuality}
-          combatPace={settings.combatPace}
+          graphicsQuality={iosSafeMode || getBootSafeMode() ? 'low' : settings.graphicsQuality}
+          combatPace={iosSafeMode || getBootSafeMode() ? 'fast' : settings.combatPace}
           showCoordinates={settings.showCoordinates}
           showValidMoves={settings.showValidMoves}
           cameraPreset={cameraPreset}
           cameraResetTrigger={cameraResetTrigger}
           latestMoveEvent={latestMoveEvent}
           skipCombatTrigger={skipCombatTrigger}
-          interactive={mode !== 'menu'}
+          interactive={mode !== 'menu' && !showGallery}
+          paused={showGallery}
           onSquareClick={handleSquareClick}
           onCombatStateChange={setCombatActive}
           onAutoDowngradeCombatPace={handleAutoDowngradeCombatPace}

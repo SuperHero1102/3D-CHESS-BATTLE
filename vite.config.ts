@@ -14,7 +14,7 @@ export default defineConfig(() => {
       react(),
       tailwindcss(),
       VitePWA({
-        registerType: 'autoUpdate',
+        registerType: 'prompt',
         includeAssets: ['favicon-64x64.png', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png', 'pwa-maskable-512x512.png'],
         manifest: {
           id: '/',
@@ -48,11 +48,48 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
+          cleanupOutdatedCaches: true,
           maximumFileSizeToCacheInBytes: 8 * 1024 * 1024,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
-          globIgnores: ['assets/aistudio/**'],
+          globIgnores: ['assets/aistudio/**', '**/*.glb', '**/*.gltf', 'models/**'],
           navigateFallback: '/index.html',
+          navigateFallbackDenylist: [/^\/api\//, /^\/socket\.io\//],
           runtimeCaching: [
+            {
+              // Never double-cache heavy GLB files in CacheStorage alongside IndexedDB
+              urlPattern: /\.(?:glb|gltf)(?:\?.*)?$/i,
+              handler: 'NetworkOnly',
+            },
+            {
+              urlPattern: /\/assets\/aistudio\/.*\.(?:png|jpe?g|webp)$/i,
+              handler: 'StaleWhileRevalidate',
+              options: {
+                cacheName: 'arena-aistudio-images',
+                expiration: {
+                  maxEntries: 12,
+                  maxAgeSeconds: 60 * 60 * 24 * 30,
+                  purgeOnQuotaError: true,
+                },
+                cacheableResponse: {
+                  statuses: [0, 200],
+                },
+              },
+            },
+            {
+              urlPattern: /\/draco\/.*/i,
+              handler: 'CacheFirst',
+              options: {
+                cacheName: 'draco-decoder-cache',
+                expiration: {
+                  maxEntries: 8,
+                  maxAgeSeconds: 60 * 60 * 24 * 90,
+                  purgeOnQuotaError: true,
+                },
+                cacheableResponse: {
+                  statuses: [0, 200],
+                },
+              },
+            },
             {
               urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
               handler: 'CacheFirst',
@@ -120,6 +157,9 @@ export default defineConfig(() => {
       },
     },
     server: {
+      host: '0.0.0.0',
+      port: 3000,
+      allowedHosts: true as const,
       hmr: process.env.DISABLE_HMR !== 'true',
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
     },

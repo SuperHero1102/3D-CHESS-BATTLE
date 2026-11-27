@@ -283,6 +283,8 @@ const VI = {
   roomErrorNotFound: 'Không tìm thấy phòng với mã này.',
   roomErrorFull: 'Phòng đã đủ 2 người chơi.',
   connectionError: 'Không thể kết nối máy chủ trực tuyến.',
+  webglLostTitle: 'Bộ nhớ đồ họa 3D bị gián đoạn — đang khôi phục...',
+  webglSafeReloadBtn: 'Mở Chế độ Siêu nhẹ & Tải lại',
 };
 
 const EN: typeof VI = {
@@ -486,6 +488,8 @@ const EN: typeof VI = {
   roomErrorNotFound: 'Room not found.',
   roomErrorFull: 'Room already has 2 players.',
   connectionError: 'Unable to reach online battle server.',
+  webglLostTitle: '3D graphics context interrupted — restoring...',
+  webglSafeReloadBtn: 'Reload in Ultra-Light Mode',
 };
 
 export type TranslationKey = keyof typeof VI;

@@ -772,6 +772,7 @@ export class ErrorOverlay { constructor() {} }
         middlewareMode: true,
         hmr: false,
         watch: null,
+        allowedHosts: true as const,
       },
       appType: 'spa',
     });

@@ -6,6 +6,7 @@ import { RotateCw, Pause, Play, X, Eye, Swords, Footprints, Sparkles } from 'luc
 import { Language, PieceColor, PieceSymbol } from '../types/chess';
 import { t } from '../i18n/translations';
 import { SETUP_V2 } from '../config/featureFlags';
+import { getBootSafeMode, isCoarsePointerDevice, isIOSDevice } from '../utils/deviceProfile';
 import { createMaterialPalette, MaterialPalette } from './materials';
 import {
   ArticulatedJointRig,
@@ -227,18 +228,24 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ lang = 'vi', onC
       }
     })();
 
+    const isIOS = isIOSDevice();
+    const isSafeMode = getBootSafeMode();
+    const isConstrained = isIOS || isCoarsePointerDevice() || isSafeMode;
+    const maxDpr = isSafeMode ? 1 : isIOS ? 1.25 : isConstrained ? 1.35 : 2;
+    const enableShadows = !isSoftwareGl && !isSafeMode;
+
     const w = container.clientWidth || window.innerWidth;
     const h = container.clientHeight || window.innerHeight;
 
     const renderer = new THREE.WebGLRenderer({
-      antialias: !isSoftwareGl,
-      powerPreference: 'high-performance',
+      antialias: !isSoftwareGl && !isSafeMode,
+      powerPreference: isConstrained ? 'default' : 'high-performance',
     });
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.08;
-    renderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
-    renderer.shadowMap.enabled = !isSoftwareGl;
+    renderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, maxDpr));
+    renderer.shadowMap.enabled = enableShadows;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.setSize(w, h);
 
@@ -276,8 +283,9 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ lang = 'vi', onC
 
     const keyLight = new THREE.DirectionalLight(0xfff1d6, 2.35);
     keyLight.position.set(2.4, 4.2, 3.1);
-    keyLight.castShadow = !isSoftwareGl;
-    keyLight.shadow.mapSize.set(2048, 2048);
+    keyLight.castShadow = enableShadows;
+    const shadowRes = isConstrained ? 1024 : 2048;
+    keyLight.shadow.mapSize.set(shadowRes, shadowRes);
     keyLight.shadow.camera.left = -1.6;
     keyLight.shadow.camera.right = 1.6;
     keyLight.shadow.camera.top = 2.0;
@@ -338,7 +346,8 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ lang = 'vi', onC
     const palette: MaterialPalette = createMaterialPalette(
       renderer.capabilities.getMaxAnisotropy(),
       isSoftwareGl,
-      () => {}
+      () => {},
+      { isConstrainedDevice: isConstrained, isSafeMode }
     );
 
     const turntableGroup = new THREE.Group();
@@ -370,7 +379,7 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ lang = 'vi', onC
       turntableGroup.clear();
       currentType = type;
       currentSide = color;
-      const rig = createWarriorPiece(palette, color, type, !isSoftwareGl);
+      const rig = createWarriorPiece(palette, color, type, enableShadows);
       // Normalize so at turntable angle = 0, piece ALWAYS faces +Z (front camera)
       rig.root.rotation.y = color === 'w' ? Math.PI : 0;
       turntableGroup.add(rig.root);
@@ -411,7 +420,7 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ lang = 'vi', onC
     };
     window.addEventListener('resize', onResize);
 
-    if (!isSoftwareGl) {
+    if (!isSoftwareGl && !isSafeMode) {
       renderer.compile(scene, camera);
     }
 
@@ -419,9 +428,10 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ lang = 'vi', onC
     let elapsedSec = 0;
     let frameId = 0;
     let disposed = false;
+    let contextLostFlag = false;
 
     const scheduleNext = () => {
-      if (disposed || document.hidden) return;
+      if (disposed || document.hidden || contextLostFlag) return;
       if (isSoftwareGl) {
         afterDraw(tick);
       } else {
@@ -434,12 +444,39 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ lang = 'vi', onC
       if (document.hidden) {
         cancelAnimationFrame(frameId);
         clearTimeout(frameId);
-      } else {
+      } else if (!contextLostFlag) {
+        lastTickMs = performance.now();
+        scheduleNext();
+      }
+    };
+    const handlePageHide = () => {
+      if (disposed) return;
+      cancelAnimationFrame(frameId);
+      clearTimeout(frameId);
+    };
+    const handlePageShow = () => {
+      if (disposed || document.hidden || contextLostFlag) return;
+      lastTickMs = performance.now();
+      scheduleNext();
+    };
+    const onContextLost = (e: Event) => {
+      e.preventDefault();
+      contextLostFlag = true;
+      cancelAnimationFrame(frameId);
+      clearTimeout(frameId);
+    };
+    const onContextRestored = () => {
+      contextLostFlag = false;
+      if (!disposed && !document.hidden) {
         lastTickMs = performance.now();
         scheduleNext();
       }
     };
     document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', handlePageHide);
+    window.addEventListener('pageshow', handlePageShow);
+    canvas.addEventListener('webglcontextlost', onContextLost);
+    canvas.addEventListener('webglcontextrestored', onContextRestored);
 
     function afterDraw(cb: () => void) {
       const gl = renderer.getContext() as WebGL2RenderingContext;
@@ -463,7 +500,7 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ lang = 'vi', onC
     }
 
     function tick() {
-      if (disposed || document.hidden) return;
+      if (disposed || document.hidden || contextLostFlag) return;
       const nowMs = performance.now();
       const rawDt = Math.max(0, (nowMs - lastTickMs) / 1000);
       lastTickMs = nowMs;
@@ -601,6 +638,10 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ lang = 'vi', onC
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', handlePageHide);
+      window.removeEventListener('pageshow', handlePageShow);
+      canvas.removeEventListener('webglcontextlost', onContextLost);
+      canvas.removeEventListener('webglcontextrestored', onContextRestored);
       window.removeEventListener('resize', onResize);
       window.removeEventListener('glb-models-updated', onGlbUpdated);
       controls.removeEventListener('start', cancelCamAnim);
@@ -610,10 +651,18 @@ export const PieceGallery3D: React.FC<PieceGallery3DProps> = ({ lang = 'vi', onC
       }
       palette.dispose();
       envTex.dispose();
+      floor.geometry.dispose();
+      studioPlinth.geometry.dispose();
+      studioRing.geometry.dispose();
       floorMat.dispose();
       studioPlinthMat.dispose();
       studioRingMat.dispose();
       renderer.dispose();
+      try {
+        renderer.getContext()?.getExtension('WEBGL_lose_context')?.loseContext();
+      } catch {
+        // Ignore if context is already lost
+      }
       if (canvas.parentElement === container) {
         container.removeChild(canvas);
       }

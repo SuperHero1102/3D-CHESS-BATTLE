@@ -3,6 +3,7 @@ import { GLTFLoader, GLTF } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { Language, PieceColor, PieceSymbol } from '../types/chess';
+import { getBootSafeMode, isConstrainedDevice, isIOSDevice } from '../utils/deviceProfile';
 
 // ============================================================================
 // 1-LINE TOGGLE: Đặt `false` để quay lại ngay bộ quân 3D cũ (fallback)
@@ -528,6 +529,33 @@ interface RemoteGlbHeaders {
   sourceUrl?: string | null;
 }
 
+async function cleanupStaleGlbIdbEntries(activeBaseUrl: string): Promise<void> {
+  const db = await openGlbIdb();
+  if (!db) return;
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(IDB_STORE_NAME, 'readwrite');
+      const store = tx.objectStore(IDB_STORE_NAME);
+      const req = store.openKeyCursor();
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) return;
+        const k = String(cursor.key);
+        const expectedSuffix = `::${GLB_MANIFEST_VERSION}::${activeBaseUrl}`;
+        if (!k.endsWith(expectedSuffix)) {
+          store.delete(cursor.key);
+        }
+        cursor.continue();
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
+    } catch {
+      resolve();
+    }
+  });
+}
+
 async function writeGlbToIdb(
   key: GlbPieceKey,
   baseUrl: string,
@@ -550,12 +578,15 @@ async function writeGlbToIdb(
         lastModified: headers?.lastModified ?? null,
         contentLength: headers?.contentLength ?? buffer.byteLength,
         sourceUrl: headers?.sourceUrl ?? null,
-        buffer: buffer.slice(0),
+        buffer,
         savedAt: Date.now(),
       };
       store.put(record);
       tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
+      tx.onerror = () => {
+        // QuotaExceededError or storage limit on iOS -> keep running cleanly without failing model load
+        resolve();
+      };
       tx.onabort = () => resolve();
     } catch {
       resolve();
@@ -685,12 +716,15 @@ function emitProgress(force = false) {
 }
 
 let sharedLoaderPromise: Promise<GLTFLoader> | null = null;
+let sharedDracoLoader: DRACOLoader | null = null;
+
 async function getSharedLoader(): Promise<GLTFLoader> {
   if (!sharedLoaderPromise) {
     sharedLoaderPromise = (async () => {
       const loader = new GLTFLoader();
       const dracoLoader = new DRACOLoader();
       dracoLoader.setDecoderPath('/draco/gltf/');
+      sharedDracoLoader = dracoLoader;
       loader.setDRACOLoader(dracoLoader);
       try {
         await MeshoptDecoder.ready;
@@ -704,23 +738,104 @@ async function getSharedLoader(): Promise<GLTFLoader> {
   return sharedLoaderPromise;
 }
 
-function configureMaterialTextures(mat: THREE.Material): boolean {
+function disposeSharedLoader(): void {
+  if (sharedDracoLoader) {
+    try {
+      sharedDracoLoader.dispose();
+    } catch {
+      // ignore
+    }
+    sharedDracoLoader = null;
+  }
+  sharedLoaderPromise = null;
+}
+
+function optimizeGlbTextureForDevice(
+  tex: THREE.Texture,
+  maxDim: number,
+  disableMipmaps: boolean,
+  seen: WeakSet<THREE.Texture>
+): void {
+  if (seen.has(tex)) return;
+  seen.add(tex);
+
+  if (disableMipmaps) {
+    tex.generateMipmaps = false;
+    tex.minFilter = THREE.LinearFilter;
+  }
+  tex.anisotropy = Math.min(tex.anisotropy || 1, 2);
+
+  const img = tex.image as {
+    width?: number;
+    height?: number;
+    naturalWidth?: number;
+    naturalHeight?: number;
+    close?: () => void;
+  } | null;
+  if (!img || typeof document === 'undefined') return;
+
+  const w = img.naturalWidth || img.width || 0;
+  const h = img.naturalHeight || img.height || 0;
+  const largest = Math.max(w, h);
+  if (largest <= maxDim || w <= 0 || h <= 0) return;
+
+  const scale = maxDim / largest;
+  const targetW = Math.max(4, Math.round(w * scale));
+  const targetH = Math.max(4, Math.round(h * scale));
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = targetW;
+    canvas.height = targetH;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.drawImage(img as CanvasImageSource, 0, 0, targetW, targetH);
+    if (typeof ImageBitmap !== 'undefined' && img instanceof ImageBitmap) {
+      img.close();
+    }
+    tex.image = canvas;
+    tex.needsUpdate = true;
+  } catch {
+    // Keep original texture if canvas resize fails
+  }
+}
+
+function configureMaterialTextures(
+  mat: THREE.Material,
+  seenTextures: WeakSet<THREE.Texture>
+): boolean {
   let hasTex = false;
   mat.userData.isSharedGlbBaseMat = true;
+  const constrained = isConstrainedDevice() || getBootSafeMode();
+  const safeMode = getBootSafeMode();
+  const colorMaxDim = safeMode ? 512 : isIOSDevice() ? 768 : 1024;
+  const auxMaxDim = safeMode ? 256 : 512;
+
   if (mat instanceof THREE.MeshStandardMaterial || mat instanceof THREE.MeshPhysicalMaterial) {
     mat.envMapIntensity = 0.6;
     if (mat.map) {
       mat.map.colorSpace = THREE.SRGBColorSpace;
+      if (constrained) {
+        optimizeGlbTextureForDevice(mat.map, colorMaxDim, safeMode, seenTextures);
+      }
       mat.map.needsUpdate = true;
       hasTex = true;
     }
     if (mat.emissiveMap) {
       mat.emissiveMap.colorSpace = THREE.SRGBColorSpace;
+      if (constrained) {
+        optimizeGlbTextureForDevice(mat.emissiveMap, auxMaxDim, safeMode, seenTextures);
+      }
       mat.emissiveMap.needsUpdate = true;
       hasTex = true;
     }
-    if (mat.normalMap || mat.roughnessMap || mat.metalnessMap || mat.aoMap) {
-      hasTex = true;
+    const auxMaps = [mat.normalMap, mat.roughnessMap, mat.metalnessMap, mat.aoMap, mat.bumpMap];
+    for (const aux of auxMaps) {
+      if (aux) {
+        if (constrained) {
+          optimizeGlbTextureForDevice(aux, auxMaxDim, safeMode, seenTextures);
+        }
+        hasTex = true;
+      }
     }
     mat.needsUpdate = true;
   }
@@ -760,6 +875,7 @@ function inspectAndPrepareGltf(
   let hasTextures = false;
   const candidateBaseMeshes: THREE.Mesh[] = [];
   const allMeshes: THREE.Mesh[] = [];
+  const seenTextures = new WeakSet<THREE.Texture>();
 
   gltf.scene.traverse((obj) => {
     if (!(obj instanceof THREE.Mesh)) return;
@@ -779,7 +895,7 @@ function inspectAndPrepareGltf(
 
     const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
     for (const m of mats) {
-      if (m && configureMaterialTextures(m)) {
+      if (m && configureMaterialTextures(m, seenTextures)) {
         hasTextures = true;
       }
     }
@@ -958,6 +1074,7 @@ async function fetchWithProgress(
     combined.set(chunk, offset);
     offset += chunk.byteLength;
   }
+  chunks.length = 0;
   return {
     buffer: combined.buffer,
     etag,
@@ -969,6 +1086,7 @@ async function fetchWithProgress(
 let hasCheckedSourceUpdates = false;
 async function checkForGlbSourceUpdates(baseUrl: string, loader: GLTFLoader): Promise<void> {
   if (!BUNDLED_MODELS || hasCheckedSourceUpdates) return;
+  if (isConstrainedDevice() || getBootSafeMode()) return;
   if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
   hasCheckedSourceUpdates = true;
 
@@ -1016,17 +1134,18 @@ async function checkForGlbSourceUpdates(baseUrl: string, loader: GLTFLoader): Pr
       const validationErr = verifyGlbBuffer(buffer, cfg.filename);
       if (validationErr) continue;
 
-      const resourceDir = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-      const gltf = await loader.parseAsync(buffer.slice(0), resourceDir);
-      const tpl = inspectAndPrepareGltf(key, gltf, 'bundled', buffer.byteLength);
-      loadedTemplates[key] = tpl;
-
       await writeGlbToIdb(key, baseUrl, buffer, {
         etag: etag ?? remoteEtag,
         lastModified: lastModified ?? remoteLastMod,
         contentLength: contentLength ?? buffer.byteLength,
         sourceUrl: targetUrl,
       });
+
+      const byteSize = buffer.byteLength;
+      const resourceDir = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+      const gltf = await loader.parseAsync(buffer, resourceDir);
+      const tpl = inspectAndPrepareGltf(key, gltf, 'bundled', byteSize);
+      loadedTemplates[key] = tpl;
 
       const normSize = computeNormalizedBoxSize(tpl.rawSize, cfg);
       slotStates[key] = {
@@ -1092,7 +1211,11 @@ export async function preloadGlbTemplates(force = false): Promise<number> {
   emitProgress(true);
 
   preloadPromise = (async () => {
+    if (BUNDLED_MODELS) {
+      await cleanupStaleGlbIdbEntries(baseUrl);
+    }
     const loader = await getSharedLoader();
+    const constrained = isConstrainedDevice() || getBootSafeMode();
     let loadedCount = 0;
 
     const processSlot = async (key: GlbPieceKey) => {
@@ -1106,13 +1229,16 @@ export async function preloadGlbTemplates(force = false): Promise<number> {
       // Launch 2+ Cache-First Hydration from persistent IndexedDB (0 network calls)
       if (BUNDLED_MODELS && !force) {
         const bundledUrl = bundledGlbByFilename[cfg.filename.toLowerCase()];
-        const cachedRec = await readGlbFromIdb(key, baseUrl);
+        let cachedRec = await readGlbFromIdb(key, baseUrl);
         if (cachedRec && cachedRec.buffer && (!bundledUrl || cachedRec.sourceUrl === bundledUrl)) {
           const checkErr = verifyGlbBuffer(cachedRec.buffer, cfg.filename);
           if (!checkErr) {
             try {
-              const gltf = await loader.parseAsync(cachedRec.buffer, '');
-              const tpl = inspectAndPrepareGltf(key, gltf, 'bundled', cachedRec.byteSize);
+              const cachedByteSize = cachedRec.byteSize;
+              const buf = cachedRec.buffer;
+              cachedRec = null;
+              const gltf = await loader.parseAsync(buf, '');
+              const tpl = inspectAndPrepareGltf(key, gltf, 'bundled', cachedByteSize);
               loadedTemplates[key] = tpl;
               debugStoreKeyByKey[key] = key;
 
@@ -1129,7 +1255,7 @@ export async function preloadGlbTemplates(force = false): Promise<number> {
                 normalizedSize: [+normSize.x.toFixed(3), +normSize.y.toFixed(3), +normSize.z.toFixed(3)],
                 source: 'bundled',
               };
-              slotBytesProgress[key] = { loaded: cachedRec.byteSize, total: cachedRec.byteSize, done: true };
+              slotBytesProgress[key] = { loaded: cachedByteSize, total: cachedByteSize, done: true };
               loadedCount++;
               emitProgress();
               if (typeof window !== 'undefined') {
@@ -1141,6 +1267,7 @@ export async function preloadGlbTemplates(force = false): Promise<number> {
             }
           }
         }
+        cachedRec = null;
       }
 
       if (!isNetworkDownloading) {
@@ -1153,31 +1280,31 @@ export async function preloadGlbTemplates(force = false): Promise<number> {
 
       for (const cand of candidates) {
         try {
-          const { buffer, etag, lastModified, contentLength } = await fetchWithProgress(
-            cand.url,
-            key,
-            cfg.filename
-          );
-          const validationErr = verifyGlbBuffer(buffer, cfg.filename);
+          const fetched = await fetchWithProgress(cand.url, key, cfg.filename);
+          let buf: ArrayBuffer | null = fetched.buffer;
+          const validationErr = verifyGlbBuffer(buf, cfg.filename);
           if (validationErr) {
+            buf = null;
             lastErr = validationErr;
             continue;
           }
-          const resourceDir = cand.url.substring(0, cand.url.lastIndexOf('/') + 1);
-          const gltf = await loader.parseAsync(buffer.slice(0), resourceDir);
-          const storedSource = BUNDLED_MODELS ? 'bundled' : cand.source;
-          const tpl = inspectAndPrepareGltf(key, gltf, storedSource, buffer.byteLength);
-          loadedTemplates[key] = tpl;
-          debugStoreKeyByKey[key] = key;
-
+          const byteLength = buf.byteLength;
           if (BUNDLED_MODELS) {
-            await writeGlbToIdb(key, baseUrl, buffer, {
-              etag,
-              lastModified,
-              contentLength,
+            // Write to IDB before GLTFLoader.parseAsync consumes/detaches buffer, avoiding buffer.slice(0) RAM spike
+            await writeGlbToIdb(key, baseUrl, buf, {
+              etag: fetched.etag,
+              lastModified: fetched.lastModified,
+              contentLength: fetched.contentLength,
               sourceUrl: cand.url,
             });
           }
+          const resourceDir = cand.url.substring(0, cand.url.lastIndexOf('/') + 1);
+          const gltf = await loader.parseAsync(buf, resourceDir);
+          buf = null;
+          const storedSource = BUNDLED_MODELS ? 'bundled' : cand.source;
+          const tpl = inspectAndPrepareGltf(key, gltf, storedSource, byteLength);
+          loadedTemplates[key] = tpl;
+          debugStoreKeyByKey[key] = key;
 
           const normSize = computeNormalizedBoxSize(tpl.rawSize, cfg);
           slotStates[key] = {
@@ -1223,15 +1350,19 @@ export async function preloadGlbTemplates(force = false): Promise<number> {
       emitProgress();
     };
 
-    // 3-worker queue keeps network & WASM parsing responsive without saturating the thread
+    // Sequential 1-by-1 loading on iOS/mobile with short GC yield to prevent JetSam RAM spikes;
+    // 3-worker parallel queue on desktop GPUs.
     const queue = [...ALL_GLB_KEYS];
-    const workerCount = Math.min(3, queue.length);
+    const workerCount = constrained ? 1 : Math.min(3, queue.length);
     await Promise.all(
       Array.from({ length: workerCount }, async () => {
         while (queue.length > 0) {
           const nextKey = queue.shift();
           if (nextKey) {
             await processSlot(nextKey);
+            if (constrained && queue.length > 0) {
+              await new Promise<void>((resolve) => setTimeout(resolve, 55));
+            }
           }
         }
       })
@@ -1242,8 +1373,8 @@ export async function preloadGlbTemplates(force = false): Promise<number> {
     hasFinishedInitialPreload = true;
     if (loadedCount === ALL_GLB_KEYS.length && BUNDLED_MODELS) {
       setWarmManifestHint(baseUrl);
-      if (!force) {
-        // Non-blocking background check: only re-downloads if remote HEAD signature actually changed
+      if (!force && !constrained) {
+        // Non-blocking background check on desktop only
         void checkForGlbSourceUpdates(baseUrl, loader);
       }
     } else {
@@ -1252,6 +1383,8 @@ export async function preloadGlbTemplates(force = false): Promise<number> {
         preloadPromise = null;
       }
     }
+    // Release DRACOLoader WASM worker memory once preload batch finishes
+    disposeSharedLoader();
     emitProgress(true);
 
     if (typeof window !== 'undefined') {
@@ -1283,9 +1416,11 @@ export async function registerCustomGlbFile(
       throw new Error(validationErr);
     }
 
-    for (const key of keysToRegister) {
+    for (let idx = 0; idx < keysToRegister.length; idx++) {
+      const key = keysToRegister[idx];
       const cfg = PIECE_CONFIG[key];
-      const gltf = await loader.parseAsync(buffer.slice(0), '');
+      const parseBuf = idx < keysToRegister.length - 1 ? buffer.slice(0) : buffer;
+      const gltf = await loader.parseAsync(parseBuf, '');
       const tpl = inspectAndPrepareGltf(key, gltf, 'upload', buffer.byteLength);
       loadedTemplates[key] = tpl;
       const normSize = computeNormalizedBoxSize(tpl.rawSize, cfg);
